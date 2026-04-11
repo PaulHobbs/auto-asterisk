@@ -1,6 +1,6 @@
-# auto — autonomous experiment loop
+# auto\* — autonomous experiment loop
 
-`auto` is an autonomous research and development loop that improves codebases through iterative experimentation. Given a task description (e.g., "optimize RPC latency" or "simplify this codebase"), `auto` explores, implements, tests, and evaluates changes in a self-correcting feedback loop.
+`auto*` is an autonomous research and development loop that improves codebases through iterative experimentation. Given a task description (e.g., "optimize RPC latency" or "simplify this codebase"), `auto*` explores, implements, tests, and evaluates changes in a self-correcting feedback loop.
 
 ## How it Works
 
