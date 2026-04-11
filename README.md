@@ -28,7 +28,7 @@ The system operates in three phases:
 
 - **Python 3.10+**
 - **Git**
-- **[Safehouse](https://github.com/eugene1g/safehouse):** Required for secure, isolated execution of actor agents.
+- **[Safehouse](https://github.com/eugene1g/agent-safehouse):** Required for secure, isolated execution of actor agents.
   ```bash
   brew install eugene1g/safehouse/agent-safehouse
   ```
