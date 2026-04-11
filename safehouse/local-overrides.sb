@@ -1,0 +1,10 @@
+;; Host-specific exceptions that should not live in shared repo config.
+(allow file-read*
+  (home-literal "/.gitconfig")
+  (home-literal "/.gitignore_global")
+  ;; For additional host-specific sandbox grants, export SAFEHOUSE_APPEND_PROFILE
+  ;; pointing to your own profile; auto will pass it as a second --append-profile:
+  ;;     export SAFEHOUSE_APPEND_PROFILE="$HOME/.config/agent-safehouse/local-overrides.sb"
+  (home-prefix "/.config")
+)
+

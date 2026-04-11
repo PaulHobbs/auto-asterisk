@@ -3,6 +3,7 @@
 import subprocess
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from auto import workspace
@@ -58,6 +59,11 @@ class TestWorktreeLifecycle:
         sha = workspace.commit_worktree(wt, "empty")
         assert sha is None
         workspace.cleanup_worktree(git_repo, wt)
+
+    def test_cleanup_idempotent(self, git_repo):
+        wt = workspace.create_worktree(git_repo, tasknum=10)
+        workspace.cleanup_worktree(git_repo, wt)
+        workspace.cleanup_worktree(git_repo, wt)  # should not raise
 
 
 class TestScanCodebase:
@@ -117,3 +123,42 @@ class TestMergeResult:
         s = r.summary()
         assert "Merge conflict" in s
         assert "auto/task-1" in s
+
+    def test_merge_with_dirty_worktree(self, git_repo):
+        # Make main repo dirty (uncommitted tracked changes)
+        (git_repo / "main.py").write_text("dirty = True\n")
+        wt = workspace.create_worktree(git_repo, tasknum=11)
+        (wt / "new.py").write_text("y = 1\n")
+        workspace.commit_worktree(wt, "change")
+        result = workspace.merge_worktree(git_repo, wt)
+        assert not result.success
+        assert "uncommitted" in result.error.lower()
+        workspace.cleanup_worktree(git_repo, wt)
+        # Restore
+        subprocess.run(["git", "checkout", "--", "main.py"], cwd=str(git_repo), capture_output=True)
+
+
+class TestRunTimeout:
+    def test_timeout_raises_runtime_error_not_timeout_expired(self):
+        """_run should convert TimeoutExpired into RuntimeError."""
+        cmd = ["git", "status"]
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd, 5)):
+            with pytest.raises(RuntimeError) as exc_info:
+                workspace._run(cmd, timeout=5)
+        assert "timed out" in str(exc_info.value).lower()
+        assert "5" in str(exc_info.value)
+        assert "git status" in str(exc_info.value)
+
+    def test_timeout_error_not_subprocess_timeout_expired(self):
+        """_run must NOT raise subprocess.TimeoutExpired — callers only need RuntimeError."""
+        cmd = ["git", "log"]
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd, 30)):
+            with pytest.raises(RuntimeError):
+                workspace._run(cmd)
+            # Confirm the raw TimeoutExpired is not leaking
+            try:
+                workspace._run(cmd)
+            except subprocess.TimeoutExpired:
+                pytest.fail("subprocess.TimeoutExpired leaked out of _run()")
+            except RuntimeError:
+                pass  # expected

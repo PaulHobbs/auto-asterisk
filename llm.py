@@ -1,6 +1,7 @@
 """Thin wrapper around the claude CLI with retries and structured output parsing."""
 
 import json
+import logging
 import re
 import subprocess
 import time
@@ -9,6 +10,8 @@ from typing import Optional
 
 
 from .config import OPUS, SONNET, HAIKU
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -47,11 +50,11 @@ def call(
             return LLMResponse(text=result.stdout, model=model)
         except subprocess.TimeoutExpired as e:
             last_error = e
-            print(f"  [llm] Timeout, retrying ({attempt + 1}/{max_retries})...")
+            log.warning(f"[llm] Timeout, retrying ({attempt + 1}/{max_retries})...")
         except RuntimeError as e:
             last_error = e
             wait = 2 ** attempt * 2
-            print(f"  [llm] Error, retrying in {wait}s: {e}")
+            log.warning(f"[llm] Error, retrying in {wait}s: {e}")
             time.sleep(wait)
 
     raise RuntimeError(f"LLM call failed after {max_retries} retries: {last_error}")
@@ -130,14 +133,6 @@ def extract_float(text: str) -> Optional[float]:
 
     # Fall back to finding a number
     match = re.search(r"(?:score|Score)\s*[:=]\s*([\d.]+)", text)
-    if match:
-        try:
-            return float(match.group(1))
-        except ValueError:
-            pass
-
-    # Last resort: first standalone number
-    match = re.search(r"\b(\d+\.?\d*)\b", text)
     if match:
         try:
             return float(match.group(1))

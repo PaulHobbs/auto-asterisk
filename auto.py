@@ -11,6 +11,7 @@ Usage:
 import argparse
 import concurrent.futures
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -28,6 +29,9 @@ from auto.config import (
 )
 
 
+log = logging.getLogger("auto")
+
+
 # ── Signal handling ─────────────────────────────────────────────────────
 
 _shutdown_requested = False
@@ -36,10 +40,10 @@ _shutdown_requested = False
 def _signal_handler(signum, frame):
     global _shutdown_requested
     if _shutdown_requested:
-        print("\n\nForce quit.")
+        log.error("Force quit.")
         sys.exit(1)
     _shutdown_requested = True
-    print("\n\nShutdown requested. Finishing current experiment...")
+    log.info("Shutdown requested. Finishing current experiment...")
 
 
 signal.signal(signal.SIGINT, _signal_handler)
@@ -59,29 +63,29 @@ def phase_rubric(db: DB, task: str, codebase: Path) -> Rubric:
     """Phase 1: Create and approve the rubric."""
     existing = db.get_rubric()
     if existing:
-        print(f"\n  Using existing approved rubric (id={existing.id})")
+        log.info(f"Using existing approved rubric (id={existing.id})")
         return existing
 
-    print("\n" + "=" * 60)
-    print("  PHASE 1: RUBRIC CREATION")
-    print("=" * 60)
-    print(f"\n  Task: {task}")
-    print("  Scanning codebase...")
+    log.info("=" * 60)
+    log.info("PHASE 1: RUBRIC CREATION")
+    log.info("=" * 60)
+    log.info(f"Task: {task}")
+    log.info("Scanning codebase...")
 
     summary = workspace.scan_codebase(codebase)
-    print(f"  Scanned {summary.count('###')} files.")
-    print("  Calling rubric agent (this may take a minute)...\n")
+    log.info(f"Scanned {summary.count('###')} files.")
+    log.info("Calling rubric agent (this may take a minute)...")
 
     rubric = agents.create_rubric(task, summary)
 
     # Show rubric to user
-    print("=" * 60)
-    print("  PROPOSED RUBRIC")
-    print("=" * 60)
-    print(f"\n  Scoring Dimensions:\n{_indent(rubric.scoring_dimensions)}\n")
-    print(f"  Judge Prompt:\n{_indent(rubric.judge_prompt)}\n")
+    log.info("=" * 60)
+    log.info("PROPOSED RUBRIC")
+    log.info("=" * 60)
+    log.info(f"Scoring Dimensions:\n{_indent(rubric.scoring_dimensions)}\n")
+    log.info(f"Judge Prompt:\n{_indent(rubric.judge_prompt)}\n")
     if rubric.setup_code:
-        print(f"  Setup Code:\n{_indent(rubric.setup_code)}\n")
+        log.info(f"Setup Code:\n{_indent(rubric.setup_code)}\n")
 
     # Ask for approval
     while True:
@@ -89,12 +93,12 @@ def phase_rubric(db: DB, task: str, codebase: Path) -> Rubric:
         if choice == "y":
             break
         elif choice == "n":
-            print("  Rubric rejected. Exiting.")
+            log.info("Rubric rejected. Exiting.")
             sys.exit(0)
         elif choice == "edit":
-            print("  (Editing not yet implemented. Approve or reject.)")
+            log.info("(Editing not yet implemented. Approve or reject.)")
         else:
-            print("  Please enter y, n, or edit.")
+            log.info("Please enter y, n, or edit.")
 
     rubric.approved = True
     rubric_id = db.save_rubric(rubric)
@@ -103,25 +107,31 @@ def phase_rubric(db: DB, task: str, codebase: Path) -> Rubric:
 
     # Run setup code if present (in safehouse sandbox when available)
     if rubric.setup_code:
-        print("\n  Running setup code...")
+        log.info("Running setup code...")
         try:
             # Try safehouse first for isolation
             try:
+                _local_overrides = Path(__file__).parent / "safehouse" / "local-overrides.sb"
+                _safehouse_cmd = ["safehouse", f"--append-profile={_local_overrides}"]
+                _user_profile = os.environ.get("SAFEHOUSE_APPEND_PROFILE")
+                if _user_profile:
+                    _safehouse_cmd.append(f"--append-profile={_user_profile}")
+                _safehouse_cmd += ["bash", "-c", rubric.setup_code]
                 result = subprocess.run(
-                    ["safehouse", "bash", "-c", rubric.setup_code],
+                    _safehouse_cmd,
                     capture_output=True, text=True, cwd=str(codebase), timeout=120,
                 )
             except FileNotFoundError:
-                print("  Warning: safehouse not found, running setup code without sandbox.")
+                log.warning("safehouse not found, running setup code without sandbox.")
                 result = subprocess.run(
                     ["bash", "-c", rubric.setup_code],
                     capture_output=True, text=True, cwd=str(codebase), timeout=120,
                 )
 
             if result.returncode != 0:
-                print(f"  Setup code warning: {result.stderr[:500]}")
+                log.warning(f"Setup code warning: {result.stderr[:500]}")
             else:
-                print("  Setup code completed.")
+                log.info("Setup code completed.")
                 # Commit any files created by setup
                 subprocess.run(
                     ["git", "add", "-A"], capture_output=True, cwd=str(codebase)
@@ -131,7 +141,7 @@ def phase_rubric(db: DB, task: str, codebase: Path) -> Rubric:
                     capture_output=True, cwd=str(codebase),
                 )
         except subprocess.TimeoutExpired:
-            print("  Setup code timed out (120s).")
+            log.warning("Setup code timed out (120s).")
 
     return rubric
 
@@ -139,13 +149,13 @@ def phase_rubric(db: DB, task: str, codebase: Path) -> Rubric:
 def phase_baseline(db: DB, rubric: Rubric, codebase: Path, time_budget: int) -> None:
     """Phase 2: Run baseline experiment."""
     if db.count() > 0:
-        print(f"\n  Baseline already exists (tasknum=0, score={db.get_best_score()})")
+        log.info(f"Baseline already exists (tasknum=0, score={db.get_best_score()})")
         return
 
-    print("\n" + "=" * 60)
-    print("  PHASE 2: BASELINE")
-    print("=" * 60)
-    print("  Running baseline (no changes)...")
+    log.info("=" * 60)
+    log.info("PHASE 2: BASELINE")
+    log.info("=" * 60)
+    log.info("Running baseline (no changes)...")
 
     tasknum = 0
     exp = Experiment(
@@ -168,6 +178,8 @@ def phase_baseline(db: DB, rubric: Rubric, codebase: Path, time_budget: int) -> 
             scoring_dimensions=rubric.scoring_dimensions,
             time_budget=time_budget,
         )
+        if not isinstance(actor_result, dict):
+            raise ValueError(f"Actor returned unexpected type: {type(actor_result)}")
 
         exp.approach = actor_result.get("approach", exp.approach)
         exp.results = actor_result.get("results", "")
@@ -192,15 +204,15 @@ def phase_baseline(db: DB, rubric: Rubric, codebase: Path, time_budget: int) -> 
     })
 
     if exp.status != "crash":
-        print("  Scoring baseline...")
+        log.info("Scoring baseline...")
         score = agents.score_experiment(rubric, exp)
         if score is not None:
             db.update_experiment(tasknum, score=score, status="judged")
-            print(f"  Baseline score: {score:.4f}")
+            log.info(f"Baseline score: {score:.4f}")
         else:
-            print("  Warning: Could not score baseline.")
+            log.warning("Could not score baseline.")
     else:
-        print(f"  Baseline crashed: {exp.stderr[:200]}")
+        log.error(f"Baseline crashed: {exp.stderr[:200]}")
 
 
 _merge_lock = threading.Lock()
@@ -225,10 +237,10 @@ def _run_single_experiment(
     best_score = db.get_best_score()
     metadata = {"idea_rationale": idea.rationale, "idea_risk": idea.risk}
 
-    print(f"\n  {'─'*56}")
-    print(f"  Experiment #{tasknum}: {idea.title}")
-    print(f"  {idea.description[:80]}")
-    print(f"  Current best: {best_score:.4f}" if best_score is not None else "  Current best: N/A")
+    log.info(f"{'─'*56}")
+    log.info(f"Experiment #{tasknum}: {idea.title}")
+    log.info(f"{idea.description[:80]}")
+    log.info(f"Current best: {best_score:.4f}" if best_score is not None else "Current best: N/A")
 
     wt = workspace.create_worktree(codebase, tasknum)
     t0 = time.time()
@@ -241,6 +253,8 @@ def _run_single_experiment(
             time_budget=time_budget,
             model=model,
         )
+        if not isinstance(actor_result, dict):
+            raise ValueError(f"Actor returned unexpected type: {type(actor_result)}")
         runtime = time.time() - t0
 
         approach = actor_result.get("approach", idea.description)
@@ -267,7 +281,7 @@ def _run_single_experiment(
         )
 
         # Score
-        print(f"  [#{tasknum}] Scoring...")
+        log.info(f"[#{tasknum}] Scoring...")
         score = agents.score_experiment(rubric, exp)
         if score is not None:
             db.update_experiment(tasknum, score=score, status="judged")
@@ -278,24 +292,24 @@ def _run_single_experiment(
                 improved = current_best is not None and score <= current_best
 
                 marker = " ★ NEW BEST" if improved else ""
-                print(f"  [#{tasknum}] Score: {score:.4f}{marker}")
+                log.info(f"[#{tasknum}] Score: {score:.4f}{marker}")
 
                 if improved:
                     sha = workspace.commit_worktree(wt, f"auto: {idea.title}")
                     if sha:
                         merge_result = workspace.merge_worktree(codebase, wt)
                         if merge_result.success:
-                            print(f"  [#{tasknum}] Merged improvements into main branch.")
+                            log.info(f"[#{tasknum}] Merged improvements into main branch.")
                         else:
-                            print(f"  [#{tasknum}] Merge failed: {merge_result.summary()}")
+                            log.error(f"[#{tasknum}] Merge failed: {merge_result.summary()}")
         else:
-            print(f"  [#{tasknum}] Could not score this experiment.")
+            log.warning(f"[#{tasknum}] Could not score this experiment.")
 
     except Exception as e:
         runtime = time.time() - t0
         db.update_experiment(tasknum, status="crash", stderr=str(e),
                              metadata={**metadata, "runtime_sec": runtime})
-        print(f"  [#{tasknum}] CRASH: {str(e)[:100]}")
+        log.error(f"[#{tasknum}] CRASH: {str(e)[:100]}")
 
     finally:
         workspace.cleanup_worktree(codebase, wt)
@@ -312,11 +326,11 @@ def phase_loop(
     workers: int = 1,
 ) -> None:
     """Phase 3: Main experiment loop."""
-    print("\n" + "=" * 60)
-    print("  PHASE 3: EXPERIMENT LOOP")
+    log.info("=" * 60)
+    log.info("PHASE 3: EXPERIMENT LOOP")
     if workers > 1:
-        print(f"  Workers: {workers}")
-    print("=" * 60)
+        log.info(f"Workers: {workers}")
+    log.info("=" * 60)
 
     director_summary = "No analysis yet. This is the first batch of experiments."
 
@@ -326,30 +340,30 @@ def phase_loop(
 
         current_count = db.count()
         if max_experiments > 0 and current_count >= max_experiments:
-            print(f"\n  Reached max experiments ({max_experiments}). Stopping.")
+            log.info(f"Reached max experiments ({max_experiments}). Stopping.")
             break
 
         # ── Director (every N experiments) ──────────────────────
         if current_count > 0 and current_count % DIRECTOR_INTERVAL == 0:
-            print(f"\n  [director] Analyzing {current_count} experiments...")
+            log.info(f"[director] Analyzing {current_count} experiments...")
             entry = agents.run_director(db, rubric)
             db.save_director_entry(entry)
             director_summary = entry.summary
-            print(f"  [director] Summary saved.")
+            log.info("[director] Summary saved.")
 
             # Print patterns if available
             if entry.patterns:
                 if entry.patterns.get("working"):
-                    print(f"  [director] Working: {entry.patterns['working'][:2]}")
+                    log.info(f"[director] Working: {entry.patterns['working'][:2]}")
                 if entry.patterns.get("next_direction"):
-                    print(f"  [director] Next: {entry.patterns['next_direction'][:80]}")
+                    log.info(f"[director] Next: {entry.patterns['next_direction'][:80]}")
 
         # ── Idea Generation ─────────────────────────────────────
-        print(f"\n  [idea-gen] Generating {ideas_per_batch} ideas...")
+        log.info(f"[idea-gen] Generating {ideas_per_batch} ideas...")
         ideas = agents.generate_ideas(db, rubric, director_summary, ideas_per_batch)
-        print(f"  [idea-gen] Got {len(ideas)} ideas:")
+        log.info(f"[idea-gen] Got {len(ideas)} ideas:")
         for i, idea in enumerate(ideas):
-            print(f"    {i+1}. {idea.title} ({idea.risk} risk)")
+            log.info(f"  {i+1}. {idea.title} ({idea.risk} risk)")
 
         # ── Run experiments (parallel if workers > 1) ──────────
         if workers <= 1:
@@ -374,12 +388,12 @@ def phase_loop(
                     try:
                         fut.result()
                     except Exception as e:
-                        print(f"  Worker exception: {e}")
+                        log.error(f"Worker exception: {e}")
 
     # Final summary
-    print("\n" + "=" * 60)
-    print("  DONE")
-    print("=" * 60)
+    log.info("=" * 60)
+    log.info("DONE")
+    log.info("=" * 60)
     db.print_summary()
 
 
@@ -421,9 +435,15 @@ Examples:
 
     args = parser.parse_args()
 
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)-7s %(message)s",
+        datefmt="%H:%M:%S",
+        level=logging.INFO,
+    )
+
     codebase = Path(args.codebase).resolve()
     if not codebase.exists():
-        print(f"Error: codebase path does not exist: {codebase}")
+        log.error(f"codebase path does not exist: {codebase}")
         sys.exit(1)
 
     work = init_work_dir(codebase)
@@ -442,11 +462,11 @@ Examples:
     if args.resume:
         rubric = db.get_rubric()
         if not rubric:
-            print("Error: No existing rubric found. Cannot resume.")
+            log.error("No existing rubric found. Cannot resume.")
             sys.exit(1)
         task = rubric.task_description
-        print(f"\n  Resuming: {task}")
-        print(f"  Experiments so far: {db.count()}")
+        log.info(f"Resuming: {task}")
+        log.info(f"Experiments so far: {db.count()}")
     else:
         task = args.task
 

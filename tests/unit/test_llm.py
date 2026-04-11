@@ -59,6 +59,16 @@ class TestExtractJson:
         result = extract_json(text)
         assert isinstance(result, list)
 
+    def test_json_with_braces_in_string(self):
+        text = '{"code": "if (x) { y(); }"}'
+        result = extract_json(text)
+        assert result == {"code": "if (x) { y(); }"}
+
+    def test_extract_json_with_newlines_in_value(self):
+        text = '{"msg": "line1\\nline2"}'
+        result = extract_json(text)
+        assert result["msg"] == "line1\nline2"
+
 
 class TestExtractFloat:
     def test_json_score(self):
@@ -71,7 +81,13 @@ class TestExtractFloat:
         assert extract_float("score=99.1") == pytest.approx(99.1)
 
     def test_standalone_number(self):
-        assert extract_float("The answer is 7.0") == pytest.approx(7.0)
+        assert extract_float("The answer is 7.0") is None
+
+    def test_rejects_line_numbers(self):
+        assert extract_float("Line 42: error occurred") is None
+
+    def test_rejects_timestamps(self):
+        assert extract_float("completed in 3.5 seconds") is None
 
     def test_no_number(self):
         assert extract_float("no numbers here") is None

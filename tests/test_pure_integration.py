@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from auto.db import DB, Experiment, Rubric
 from auto import agents, workspace
+from auto import auto as auto_module
 
 
 @pytest.fixture
@@ -115,6 +116,24 @@ class TestRunActorMocked:
 
         assert result["returncode"] == -1
         assert "TIMEOUT" in result["stderr"]
+
+
+class TestActorResultValidation:
+    def test_phase_baseline_non_dict_actor_result_sets_crash(self, tmp_path, rubric):
+        """phase_baseline should set status='crash' when run_actor returns a non-dict."""
+        db = DB(tmp_path / "test.db")
+        fake_worktree = tmp_path / "worktree"
+        fake_worktree.mkdir()
+
+        with patch("auto.agents.run_actor", return_value="not a dict"):
+            with patch("auto.workspace.create_worktree", return_value=fake_worktree):
+                with patch("auto.workspace.cleanup_worktree"):
+                    auto_module.phase_baseline(db, rubric, tmp_path, time_budget=60)
+
+        assert db.count() == 1
+        experiments = db.get_all()
+        assert experiments[0].status == "crash"
+        db.close()
 
 
 class TestWorktreeIntegration:

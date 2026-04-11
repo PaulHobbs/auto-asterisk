@@ -5,6 +5,8 @@ No class hierarchy, no agent base class. Just functions.
 """
 
 import json
+import logging
+import os
 import subprocess
 import time
 from dataclasses import dataclass
@@ -14,6 +16,8 @@ from typing import Optional
 from . import llm
 from .config import SONNET
 from .db import DB, DirectorEntry, Experiment, Rubric
+
+log = logging.getLogger(__name__)
 
 
 # ── Rubric Agent ────────────────────────────────────────────────────────
@@ -129,8 +133,15 @@ def run_actor(
         scoring_dimensions=scoring_dimensions,
     )
 
+    _local_overrides = Path(__file__).parent / "safehouse" / "local-overrides.sb"
     cmd = [
         "safehouse",
+        f"--append-profile={_local_overrides}",
+    ]
+    _user_profile = os.environ.get("SAFEHOUSE_APPEND_PROFILE")
+    if _user_profile:
+        cmd.append(f"--append-profile={_user_profile}")
+    cmd += [
         "claude",
         "--print",
         "--dangerously-skip-permissions",
@@ -255,7 +266,7 @@ Score this experiment. Respond with ONLY: {{"score": <float>}}
                 return score
         except Exception as e:
             if attempt == 2:
-                print(f"  [judge] Failed to score after 3 attempts: {e}")
+                log.error(f"[judge] Failed to score after 3 attempts: {e}")
                 return None
             time.sleep(1)
 

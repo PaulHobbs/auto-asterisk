@@ -7,12 +7,15 @@ Schema:
 """
 
 import json
+import logging
 import sqlite3
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+log = logging.getLogger(__name__)
 
 
 @dataclass

@@ -4,6 +4,7 @@ Each experiment runs in its own git worktree so actors can modify files
 without affecting the main branch or other concurrent experiments.
 """
 
+import logging
 import shutil
 import subprocess
 import uuid
@@ -11,14 +12,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from auto.config import GIT_TIMEOUT
+
+log = logging.getLogger(__name__)
+
 
 WORKTREE_DIR = ".auto/worktrees"
 
 
-def _run(cmd: list[str], cwd: Optional[str] = None, check: bool = True) -> str:
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, cwd=cwd, timeout=30
-    )
+def _run(cmd: list[str], cwd: Optional[str] = None, check: bool = True, timeout: int = GIT_TIMEOUT) -> str:
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"Command timed out after {timeout}s: {' '.join(cmd)}"
+        )
     if check and result.returncode != 0:
         raise RuntimeError(
             f"Command failed: {' '.join(cmd)}\n"

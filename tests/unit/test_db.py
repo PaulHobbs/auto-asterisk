@@ -74,6 +74,29 @@ class TestExperiments:
         got = db.get_experiment(0)
         assert got.metadata == {"key": "val"}
 
+    def test_update_ignores_unknown_fields(self, db):
+        db.insert_experiment(Experiment(tasknum=0, approach="a"))
+        db.update_experiment(0, unknown_field="bad")
+        got = db.get_experiment(0)
+        assert got.approach == "a"  # unchanged, no crash
+
+    def test_update_metadata_serialization(self, db):
+        db.insert_experiment(Experiment(tasknum=0, approach="a"))
+        db.update_experiment(0, metadata={"runtime": 42.5})
+        got = db.get_experiment(0)
+        assert got.metadata["runtime"] == 42.5
+
+    def test_get_all_ordering(self, db):
+        for i in [3, 1, 2]:
+            db.insert_experiment(Experiment(tasknum=i, approach=f"exp{i}"))
+        all_exps = db.get_all()
+        assert [e.tasknum for e in all_exps] == [1, 2, 3]
+
+    def test_get_best_score_excludes_crashed(self, db):
+        db.insert_experiment(Experiment(tasknum=0, approach="a", score=1.0, status="crash"))
+        db.insert_experiment(Experiment(tasknum=1, approach="b", score=5.0, status="judged"))
+        assert db.get_best_score() == 5.0  # crash excluded
+
 
 class TestRubric:
     def test_save_and_get(self, db):
