@@ -7,6 +7,7 @@ Outputs a JSON report that the judge agent can score.
 import json
 import random
 import string
+import subprocess
 import time
 import traceback
 import sys
@@ -44,6 +45,22 @@ def get_expected_top_k(corpus: str, k: int = 10) -> list[tuple[str, int]]:
     return Counter(words).most_common(k)
 
 
+def check_git_access() -> dict:
+    """Verify git commands work (catches sandbox/permission issues)."""
+    checks = {}
+    for cmd, label in [
+        (["git", "rev-parse", "HEAD"], "rev-parse"),
+        (["git", "status", "--porcelain"], "status"),
+        (["git", "log", "--oneline", "-1"], "log"),
+    ]:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            checks[label] = r.returncode == 0
+        except Exception as e:
+            checks[label] = False
+    return checks
+
+
 def run_benchmark() -> dict:
     """Run the benchmark and return results."""
     report = {
@@ -52,6 +69,14 @@ def run_benchmark() -> dict:
         "words_processed": 0,
         "error": None,
     }
+
+    # Environment check: git must be accessible (verifies sandbox config)
+    git_checks = check_git_access()
+    report["git_access"] = git_checks
+    if not all(git_checks.values()):
+        failed = [k for k, v in git_checks.items() if not v]
+        report["error"] = f"git access check failed: {', '.join(failed)}"
+        return report
 
     corpus = generate_corpus(n_words=5000)
     k = 10

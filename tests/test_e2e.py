@@ -32,6 +32,7 @@ from auto.db import DB
 
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixture"
+LOCAL_OVERRIDES = Path(__file__).resolve().parent.parent / "safehouse" / "local-overrides.sb"
 MAX_EXPERIMENTS = 5
 TIME_BUDGET = 120  # 2 min per experiment (these are fast benchmarks)
 
@@ -153,6 +154,45 @@ def verify_git(project: Path) -> dict:
     return {"total_commits": len(commits), "auto_commits": len(auto_commits)}
 
 
+def _run_in_safehouse(cmd: list[str], cwd: str) -> subprocess.CompletedProcess:
+    """Run a command inside safehouse with project + user append-profiles."""
+    full_cmd = ["safehouse", f"--append-profile={LOCAL_OVERRIDES}"]
+    user_profile = os.environ.get("SAFEHOUSE_APPEND_PROFILE")
+    if user_profile:
+        full_cmd.append(f"--append-profile={user_profile}")
+    full_cmd += ["--", *cmd]
+    return subprocess.run(full_cmd, capture_output=True, text=True, cwd=cwd, timeout=30)
+
+
+def verify_safehouse_git(project: Path) -> bool:
+    """Verify that git commands work inside safehouse against the project repo."""
+    try:
+        subprocess.run(["safehouse", "--version"], capture_output=True, timeout=5)
+    except FileNotFoundError:
+        print("  [skip] safehouse not installed")
+        return True  # don't block e2e if safehouse isn't present
+
+    checks = [
+        (["git", "status", "--porcelain"], "git status"),
+        (["git", "log", "--oneline", "-5"], "git log"),
+        (["git", "diff"], "git diff"),
+        (["git", "rev-parse", "HEAD"], "git rev-parse"),
+        (["git", "branch", "--list"], "git branch"),
+        (["git", "config", "--global", "--list"], "git config --global"),
+    ]
+
+    all_ok = True
+    for cmd, label in checks:
+        result = _run_in_safehouse(cmd, cwd=str(project))
+        if result.returncode != 0:
+            print(f"  [FAIL] {label}: exit {result.returncode} — {result.stderr.strip()}")
+            all_ok = False
+        else:
+            print(f"  [ok] {label}")
+
+    return all_ok
+
+
 def verify_cleanup(project: Path) -> bool:
     """Check that worktrees were cleaned up."""
     worktrees = project / ".auto" / "worktrees"
@@ -163,6 +203,27 @@ def verify_cleanup(project: Path) -> bool:
             return False
     print(f"  [ok] All worktrees cleaned up")
     return True
+
+
+def verify_benchmark_unmodified(project: Path) -> bool:
+    """Verify benchmark.py wasn't tampered with by the actor."""
+    original = (FIXTURE_DIR / "benchmark.py").read_text()
+    current = (project / "benchmark.py").read_text()
+    if original == current:
+        print("  [ok] benchmark.py is unmodified")
+        return True
+    else:
+        print("  [FAIL] benchmark.py was modified by the actor!")
+        # Show what changed
+        import difflib
+        diff = difflib.unified_diff(
+            original.splitlines(), current.splitlines(),
+            fromfile="fixture/benchmark.py", tofile="project/benchmark.py",
+            lineterm="",
+        )
+        for line in list(diff)[:20]:
+            print(f"       {line}")
+        return False
 
 
 def verify_performance(project: Path, baseline_latency: float) -> dict:
@@ -199,12 +260,18 @@ def run_e2e(dry_run: bool = False, model: str = None):
         tmpdir = Path(tmpdir)
 
         # Setup
-        print("\n[1/6] Setting up test project...")
+        print("\n[1/9] Setting up test project...")
         project = setup_test_project(tmpdir)
         print(f"  Project at: {project}")
 
+        # Pre-flight: verify safehouse allows git
+        print("\n[2/9] Verifying safehouse git access...")
+        safehouse_ok = verify_safehouse_git(project)
+        if not safehouse_ok:
+            print("  [!!] Safehouse git pre-flight failed — actor may not work correctly")
+
         # Baseline benchmark
-        print("\n[2/6] Running baseline benchmark...")
+        print("\n[3/9] Running baseline benchmark...")
         baseline = run_baseline_benchmark(project)
         print(f"  Baseline latency: {baseline['latency_ms']:.2f}ms (5k words)")
         print(f"  Baseline latency: {baseline['latency_15k_ms']:.2f}ms (15k words)")
@@ -212,10 +279,10 @@ def run_e2e(dry_run: bool = False, model: str = None):
 
         if dry_run:
             print("\n[DRY RUN] Skipping auto loop. Setup verified.")
-            return True
+            return safehouse_ok
 
         # Run auto loop
-        print(f"\n[3/6] Running auto loop (max {MAX_EXPERIMENTS} experiments)...")
+        print(f"\n[4/9] Running auto loop (max {MAX_EXPERIMENTS} experiments)...")
         print(f"  Time budget per experiment: {TIME_BUDGET}s")
         print(f"  This will take several minutes...\n")
 
@@ -226,7 +293,9 @@ def run_e2e(dry_run: bool = False, model: str = None):
                 "Make compute.py faster. The benchmark is benchmark.py — run it to "
                 "measure latency. The main function is top_k_frequent(). The current "
                 "implementation is O(n^2) and uses bubble sort. Optimize it while "
-                "keeping the same function signatures and correctness.",
+                "keeping the same function signatures and correctness. "
+                "IMPORTANT: Do not modify benchmark.py — it contains environment "
+                "checks that must remain intact.",
                 "--codebase", str(project),
                 "--max-experiments", str(MAX_EXPERIMENTS),
                 "--time-budget", str(TIME_BUDGET),
@@ -254,18 +323,26 @@ def run_e2e(dry_run: bool = False, model: str = None):
             print(f"  --- end output ---\n")
 
         # Verify DB
-        print("\n[4/6] Verifying database state...")
+        print("\n[5/9] Verifying database state...")
         db_results = verify_db(project)
 
         # Verify git
-        print("\n[5/6] Verifying git history...")
+        print("\n[6/9] Verifying git history...")
         git_results = verify_git(project)
 
         # Verify cleanup
         cleanup_ok = verify_cleanup(project)
 
+        # Verify benchmark wasn't tampered with
+        print("\n[7/9] Verifying benchmark integrity...")
+        benchmark_ok = verify_benchmark_unmodified(project)
+
+        # Post-loop: verify safehouse git still works after mutations
+        print("\n[8/9] Verifying safehouse git access (post-loop)...")
+        safehouse_post_ok = verify_safehouse_git(project)
+
         # Verify performance
-        print("\n[6/6] Verifying performance improvement...")
+        print("\n[9/9] Verifying performance improvement...")
         perf_results = verify_performance(project, baseline["latency_ms"])
 
         # Final report
@@ -274,6 +351,7 @@ def run_e2e(dry_run: bool = False, model: str = None):
         print("=" * 60)
 
         checks = [
+            ("Safehouse git (pre)", safehouse_ok),
             ("Rubric created", db_results.get("rubric", False)),
             ("Baseline scored", db_results.get("baseline_score") is not None),
             ("Experiments ran", db_results.get("total_experiments", 0) >= MAX_EXPERIMENTS),
@@ -281,7 +359,9 @@ def run_e2e(dry_run: bool = False, model: str = None):
             ("Score improved", db_results.get("improved", False)),
             ("Code actually faster", perf_results.get("speedup", 0) > 1.5),
             ("Correctness maintained", perf_results.get("correctness", False)),
+            ("Benchmark unmodified", benchmark_ok),
             ("Worktrees cleaned", cleanup_ok),
+            ("Safehouse git (post)", safehouse_post_ok),
         ]
 
         all_pass = True

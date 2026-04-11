@@ -228,6 +228,17 @@ def score_experiment(
     if len(stderr_truncated) > max_stderr:
         stderr_truncated = "...(truncated)...\n" + stderr_truncated[-max_stderr:]
 
+    # If the experiment modified benchmark/evaluation files, reject it outright
+    diff = experiment.diff or ""
+    protected_files = ["benchmark.py", "bench_", "eval_", "score_"]
+    tampered = any(
+        f"a/{pf}" in diff or f"b/{pf}" in diff
+        for pf in protected_files
+    )
+    if tampered:
+        log.warning(f"[judge] Experiment {experiment.tasknum} modified protected files — assigning max penalty")
+        return 999.0
+
     prompt = f"""{rubric.judge_prompt}
 
 ---
@@ -252,7 +263,7 @@ def score_experiment(
 
 **Diff (changes made):**
 ```
-{(experiment.diff or 'No diff available')[:2000]}
+{diff[:2000]}
 ```
 
 Score this experiment. Respond with ONLY: {{"score": <float>}}
