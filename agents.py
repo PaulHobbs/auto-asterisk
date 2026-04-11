@@ -142,14 +142,23 @@ def run_actor(
     if _user_profile:
         cmd.append(f"--append-profile={_user_profile}")
     cmd += [
+        "--",
         "claude",
-        "--print",
+        "-p", prompt,
         "--dangerously-skip-permissions",
         "--model", model,
         "--max-turns", str(max_turns),
-        "-p", prompt,
     ]
 
+    claude_cmd = [
+        "claude",
+        "-p", prompt,
+        "--dangerously-skip-permissions",
+        "--model", model,
+        "--max-turns", str(max_turns),
+    ]
+
+    log.info(f"[actor] Running in {worktree_path}")
     try:
         result = subprocess.run(
             cmd,
@@ -158,6 +167,19 @@ def run_actor(
             cwd=str(worktree_path),
             timeout=time_budget + 120,  # extra buffer for LLM calls
         )
+        # Safehouse failed to apply sandbox — fall back to running without it
+        if result.returncode != 0 and "sandbox" in (result.stderr or "").lower():
+            log.warning(
+                f"[actor] Safehouse sandbox failed (exit {result.returncode}), "
+                "retrying without sandbox."
+            )
+            result = subprocess.run(
+                claude_cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(worktree_path),
+                timeout=time_budget + 120,
+            )
         stdout = result.stdout
         stderr = result.stderr
         returncode = result.returncode

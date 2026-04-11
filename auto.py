@@ -53,9 +53,32 @@ signal.signal(signal.SIGTERM, _signal_handler)
 # ── Orchestrator ────────────────────────────────────────────────────────
 
 def init_work_dir(codebase: Path) -> Path:
-    """Create the .auto/ work directory."""
+    """Create the .auto/ work directory and ensure it's gitignored."""
     work = codebase / WORK_DIR
     work.mkdir(parents=True, exist_ok=True)
+
+    # Ensure work dir and build artifacts are gitignored so they don't
+    # dirty the working tree or cause merge conflicts
+    gitignore = codebase / ".gitignore"
+    ignore_entries = [f"/{WORK_DIR}/", "__pycache__/", "*.pyc"]
+    if gitignore.exists():
+        content = gitignore.read_text()
+    else:
+        content = ""
+    new_entries = [e for e in ignore_entries if e not in content]
+    if new_entries:
+        gitignore.write_text(
+            content.rstrip("\n") + "\n" + "\n".join(new_entries) + "\n"
+        )
+        # Commit .gitignore so worktrees inherit it
+        subprocess.run(
+            ["git", "add", ".gitignore"], capture_output=True, cwd=str(codebase)
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "auto: add .gitignore"],
+            capture_output=True, cwd=str(codebase),
+        )
+
     return work
 
 
@@ -116,11 +139,18 @@ def phase_rubric(db: DB, task: str, codebase: Path) -> Rubric:
                 _user_profile = os.environ.get("SAFEHOUSE_APPEND_PROFILE")
                 if _user_profile:
                     _safehouse_cmd.append(f"--append-profile={_user_profile}")
-                _safehouse_cmd += ["bash", "-c", rubric.setup_code]
+                _safehouse_cmd += ["--", "bash", "-c", rubric.setup_code]
                 result = subprocess.run(
                     _safehouse_cmd,
                     capture_output=True, text=True, cwd=str(codebase), timeout=120,
                 )
+                # Safehouse failed — fall back to running without sandbox
+                if result.returncode != 0 and "sandbox" in (result.stderr or "").lower():
+                    log.warning("Safehouse sandbox failed for setup code, retrying without sandbox.")
+                    result = subprocess.run(
+                        ["bash", "-c", rubric.setup_code],
+                        capture_output=True, text=True, cwd=str(codebase), timeout=120,
+                    )
             except FileNotFoundError:
                 log.warning("safehouse not found, running setup code without sandbox.")
                 result = subprocess.run(
@@ -263,6 +293,15 @@ def _run_single_experiment(
         stderr = actor_result.get("stderr", "")
         diff = workspace.get_diff(wt)
 
+        log.info(f"[#{tasknum}] Actor returncode: {actor_result.get('returncode', 'N/A')}")
+        log.info(f"[#{tasknum}] Diff length: {len(diff)} chars")
+        if not diff.strip():
+            log.warning(f"[#{tasknum}] No file changes detected in worktree!")
+            if stderr:
+                log.warning(f"[#{tasknum}] Actor stderr (tail): {stderr[-500:]}")
+        else:
+            log.info(f"[#{tasknum}] Diff preview: {diff[:200]}")
+
         db.update_experiment(tasknum, **{
             "approach": approach,
             "results": results,
@@ -302,6 +341,8 @@ def _run_single_experiment(
                             log.info(f"[#{tasknum}] Merged improvements into main branch.")
                         else:
                             log.error(f"[#{tasknum}] Merge failed: {merge_result.summary()}")
+                    else:
+                        log.warning(f"[#{tasknum}] Score improved but commit failed — nothing to merge.")
         else:
             log.warning(f"[#{tasknum}] Could not score this experiment.")
 

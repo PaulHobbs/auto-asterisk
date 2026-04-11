@@ -47,14 +47,14 @@ def setup_test_project(tmpdir: Path) -> Path:
         if f.is_file():
             shutil.copy2(f, project / f.name)
 
-    # Init git repo
+    # Init git repo with local user config so commits work in worktrees too
     subprocess.run(["git", "init"], cwd=str(project), capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.name", "auto-test"], cwd=str(project), capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "auto@test.com"], cwd=str(project), capture_output=True, check=True)
     subprocess.run(["git", "add", "-A"], cwd=str(project), capture_output=True, check=True)
     subprocess.run(
         ["git", "commit", "-m", "initial: deliberately slow implementation"],
         cwd=str(project), capture_output=True, check=True,
-        env={**os.environ, "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@test.com",
-             "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@test.com"},
     )
 
     return project
@@ -171,6 +171,12 @@ def verify_safehouse_git(project: Path) -> bool:
     except FileNotFoundError:
         print("  [skip] safehouse not installed")
         return True  # don't block e2e if safehouse isn't present
+
+    # Quick check: can safehouse apply its sandbox at all?
+    probe = _run_in_safehouse(["true"], cwd=str(project))
+    if probe.returncode != 0 and "sandbox" in (probe.stderr or "").lower():
+        print("  [skip] safehouse sandbox-exec not permitted on this system")
+        return True  # don't block e2e if sandbox can't be applied
 
     checks = [
         (["git", "status", "--porcelain"], "git status"),
@@ -315,10 +321,22 @@ def run_e2e(dry_run: bool = False, model: str = None):
             if result.stderr:
                 print(f"  Stderr (last 500 chars): {result.stderr[-500:]}")
 
-        # Print auto.py stdout (last 2000 chars)
+        # Save full logs to file and print tail
+        if result.stderr:
+            log_file = tmpdir / "auto_logs.txt"
+            log_file.write_text(result.stderr)
+            print(f"\n  Full logs saved to: {log_file}")
+            # Print merge/commit related lines
+            print(f"\n  --- merge/commit/diff log lines ---")
+            for line in result.stderr.split("\n"):
+                if any(kw in line.lower() for kw in ["merge", "commit", "diff length", "no file changes", "new best", "score improved"]):
+                    print(f"  | {line}")
+            print(f"  --- end filtered logs ---\n")
+
+        # Print auto.py stdout (last 5000 chars)
         if result.stdout:
             print(f"\n  --- auto.py output (tail) ---")
-            for line in result.stdout[-2000:].split("\n"):
+            for line in result.stdout[-5000:].split("\n"):
                 print(f"  | {line}")
             print(f"  --- end output ---\n")
 

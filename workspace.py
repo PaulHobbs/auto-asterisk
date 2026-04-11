@@ -91,14 +91,22 @@ def commit_worktree(worktree_path: str | Path, message: str) -> Optional[str]:
     # Check if there's anything to commit
     status = _run(["git", "status", "--porcelain"], cwd=str(worktree_path), check=False)
     if not status.strip():
+        log.warning(f"commit_worktree: nothing to commit in {worktree_path.name}")
         return None
 
-    _run(
+    head_before = _run(["git", "rev-parse", "HEAD"], cwd=str(worktree_path), check=False)
+    result = subprocess.run(
         ["git", "commit", "-m", message],
-        cwd=str(worktree_path),
-        check=False,
+        cwd=str(worktree_path), capture_output=True, text=True, timeout=GIT_TIMEOUT,
     )
-    return _run(["git", "rev-parse", "HEAD"], cwd=str(worktree_path))
+    head_after = _run(["git", "rev-parse", "HEAD"], cwd=str(worktree_path), check=False)
+    if head_before == head_after:
+        log.error(
+            f"commit_worktree: git commit failed in {worktree_path.name}: "
+            f"{result.stderr.strip()[:200]}"
+        )
+        return None
+    return head_after
 
 
 @dataclass
@@ -178,7 +186,28 @@ def merge_worktree(codebase: str | Path, worktree_path: str | Path) -> MergeResu
     if merge_proc.returncode == 0:
         return MergeResult(success=True, branch=branch, main_branch=main_branch)
 
-    # Merge failed — gather details
+    # Merge failed — check if untracked files are the cause and retry
+    if "untracked working tree files would be overwritten" in merge_proc.stderr:
+        # Remove conflicting untracked files and retry
+        for line in merge_proc.stderr.split("\n"):
+            line = line.strip()
+            if line and not line.startswith("error:") and not line.startswith("Please"):
+                untracked = codebase / line
+                if untracked.exists() and not untracked.is_dir():
+                    log.info(f"Removing untracked file blocking merge: {line}")
+                    untracked.unlink()
+                elif untracked.is_dir():
+                    log.info(f"Removing untracked dir blocking merge: {line}")
+                    shutil.rmtree(untracked, ignore_errors=True)
+
+        merge_proc = subprocess.run(
+            ["git", "merge", branch, "--no-edit", "-m", f"auto: merge {branch}"],
+            capture_output=True, text=True, cwd=str(codebase), timeout=30,
+        )
+        if merge_proc.returncode == 0:
+            return MergeResult(success=True, branch=branch, main_branch=main_branch)
+
+    # Merge still failed — gather details
     conflict_files = _run(
         ["git", "diff", "--name-only", "--diff-filter=U"],
         cwd=str(codebase), check=False,
