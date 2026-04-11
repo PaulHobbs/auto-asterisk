@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import llm
+from .config import SONNET
 from .db import DB, DirectorEntry, Experiment, Rubric
 
 
@@ -113,7 +114,7 @@ def run_actor(
     best_score: Optional[float],
     scoring_dimensions: str,
     time_budget: int = 300,
-    model: str = "claude-sonnet-4-6",
+    model: str = SONNET,
     max_turns: int = 30,
 ) -> dict:
     """Run the actor agent as a claude CLI subprocess.

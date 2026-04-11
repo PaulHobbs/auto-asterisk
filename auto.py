@@ -9,31 +9,23 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
-# Add parent to path so we can import as a package or standalone
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from auto.db import DB, DirectorEntry, Experiment, Rubric
 from auto import agents, llm, workspace
-
-
-# ── Constants ───────────────────────────────────────────────────────────
-
-WORK_DIR = ".auto"
-DB_FILE = "experiments.db"
-DIRECTOR_INTERVAL = 5       # run director every N experiments
-IDEAS_PER_BATCH = 3         # ideas to generate per batch
-DEFAULT_TIME_BUDGET = 300   # seconds per actor run
-DEFAULT_MAX_EXPERIMENTS = 0 # 0 = unlimited
-DEFAULT_MODEL = "claude-sonnet-4-6"
+from auto.config import (
+    WORK_DIR, DB_FILE, DIRECTOR_INTERVAL, IDEAS_PER_BATCH,
+    DEFAULT_TIME_BUDGET, DEFAULT_MAX_EXPERIMENTS, DEFAULT_MODEL,
+)
 
 
 # ── Signal handling ─────────────────────────────────────────────────────
@@ -109,14 +101,23 @@ def phase_rubric(db: DB, task: str, codebase: Path) -> Rubric:
     db.approve_rubric(rubric_id)
     rubric.id = rubric_id
 
-    # Run setup code if present
+    # Run setup code if present (in safehouse sandbox when available)
     if rubric.setup_code:
         print("\n  Running setup code...")
         try:
-            result = subprocess.run(
-                ["bash", "-c", rubric.setup_code],
-                capture_output=True, text=True, cwd=str(codebase), timeout=120,
-            )
+            # Try safehouse first for isolation
+            try:
+                result = subprocess.run(
+                    ["safehouse", "bash", "-c", rubric.setup_code],
+                    capture_output=True, text=True, cwd=str(codebase), timeout=120,
+                )
+            except FileNotFoundError:
+                print("  Warning: safehouse not found, running setup code without sandbox.")
+                result = subprocess.run(
+                    ["bash", "-c", rubric.setup_code],
+                    capture_output=True, text=True, cwd=str(codebase), timeout=120,
+                )
+
             if result.returncode != 0:
                 print(f"  Setup code warning: {result.stderr[:500]}")
             else:
@@ -202,6 +203,104 @@ def phase_baseline(db: DB, rubric: Rubric, codebase: Path, time_budget: int) -> 
         print(f"  Baseline crashed: {exp.stderr[:200]}")
 
 
+_merge_lock = threading.Lock()
+
+
+def _run_single_experiment(
+    db: DB,
+    rubric: Rubric,
+    codebase: Path,
+    idea: "agents.Idea",
+    time_budget: int,
+    model: str,
+) -> None:
+    """Run a single experiment in its own worktree. Thread-safe."""
+    if _shutdown_requested:
+        return
+
+    tasknum = db.reserve_tasknum(
+        approach=f"{idea.title}: {idea.description}",
+        status="running",
+    )
+    best_score = db.get_best_score()
+    metadata = {"idea_rationale": idea.rationale, "idea_risk": idea.risk}
+
+    print(f"\n  {'─'*56}")
+    print(f"  Experiment #{tasknum}: {idea.title}")
+    print(f"  {idea.description[:80]}")
+    print(f"  Current best: {best_score:.4f}" if best_score is not None else "  Current best: N/A")
+
+    wt = workspace.create_worktree(codebase, tasknum)
+    t0 = time.time()
+    try:
+        actor_result = agents.run_actor(
+            worktree_path=wt,
+            idea_description=idea.description,
+            best_score=best_score,
+            scoring_dimensions=rubric.scoring_dimensions,
+            time_budget=time_budget,
+            model=model,
+        )
+        runtime = time.time() - t0
+
+        approach = actor_result.get("approach", idea.description)
+        results = actor_result.get("results", "")
+        stdout = actor_result.get("stdout", "")
+        stderr = actor_result.get("stderr", "")
+        diff = workspace.get_diff(wt)
+
+        db.update_experiment(tasknum, **{
+            "approach": approach,
+            "results": results,
+            "stdout": stdout,
+            "stderr": stderr,
+            "diff": diff,
+            "status": "success",
+            "metadata": {**metadata, "runtime_sec": runtime},
+        })
+
+        # Build an Experiment for scoring
+        exp = Experiment(
+            tasknum=tasknum, approach=approach, results=results,
+            stdout=stdout, stderr=stderr, diff=diff, status="success",
+            metadata=metadata,
+        )
+
+        # Score
+        print(f"  [#{tasknum}] Scoring...")
+        score = agents.score_experiment(rubric, exp)
+        if score is not None:
+            db.update_experiment(tasknum, score=score, status="judged")
+
+            # Re-check best score under merge lock to avoid TOCTOU race
+            with _merge_lock:
+                current_best = db.get_best_score()
+                improved = current_best is not None and score <= current_best
+
+                marker = " ★ NEW BEST" if improved else ""
+                print(f"  [#{tasknum}] Score: {score:.4f}{marker}")
+
+                if improved:
+                    sha = workspace.commit_worktree(wt, f"auto: {idea.title}")
+                    if sha:
+                        merge_result = workspace.merge_worktree(codebase, wt)
+                        if merge_result.success:
+                            print(f"  [#{tasknum}] Merged improvements into main branch.")
+                        else:
+                            print(f"  [#{tasknum}] Merge failed: {merge_result.summary()}")
+        else:
+            print(f"  [#{tasknum}] Could not score this experiment.")
+
+    except Exception as e:
+        runtime = time.time() - t0
+        db.update_experiment(tasknum, status="crash", stderr=str(e),
+                             metadata={**metadata, "runtime_sec": runtime})
+        print(f"  [#{tasknum}] CRASH: {str(e)[:100]}")
+
+    finally:
+        workspace.cleanup_worktree(codebase, wt)
+
+
 def phase_loop(
     db: DB,
     rubric: Rubric,
@@ -210,10 +309,13 @@ def phase_loop(
     max_experiments: int,
     model: str,
     ideas_per_batch: int = IDEAS_PER_BATCH,
+    workers: int = 1,
 ) -> None:
     """Phase 3: Main experiment loop."""
     print("\n" + "=" * 60)
     print("  PHASE 3: EXPERIMENT LOOP")
+    if workers > 1:
+        print(f"  Workers: {workers}")
     print("=" * 60)
 
     director_summary = "No analysis yet. This is the first batch of experiments."
@@ -249,86 +351,30 @@ def phase_loop(
         for i, idea in enumerate(ideas):
             print(f"    {i+1}. {idea.title} ({idea.risk} risk)")
 
-        # ── Run experiments ─────────────────────────────────────
-        for idea in ideas:
-            if _shutdown_requested:
-                break
+        # ── Run experiments (parallel if workers > 1) ──────────
+        if workers <= 1:
+            for idea in ideas:
+                if _shutdown_requested:
+                    break
+                _run_single_experiment(db, rubric, codebase, idea, time_budget, model)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = []
+                for idea in ideas:
+                    if _shutdown_requested:
+                        break
+                    fut = executor.submit(
+                        _run_single_experiment, db, rubric, codebase,
+                        idea, time_budget, model,
+                    )
+                    futures.append(fut)
 
-            tasknum = db.next_tasknum()
-            best_score = db.get_best_score()
-
-            print(f"\n  {'─'*56}")
-            print(f"  Experiment #{tasknum}: {idea.title}")
-            print(f"  {idea.description[:80]}")
-            print(f"  Current best: {best_score:.4f}" if best_score is not None else "  Current best: N/A")
-
-            exp = Experiment(
-                tasknum=tasknum,
-                approach=f"{idea.title}: {idea.description}",
-                status="running",
-                metadata={"idea_rationale": idea.rationale, "idea_risk": idea.risk},
-            )
-            db.insert_experiment(exp)
-
-            # Create worktree and run actor
-            wt = workspace.create_worktree(codebase, tasknum)
-            t0 = time.time()
-            try:
-                actor_result = agents.run_actor(
-                    worktree_path=wt,
-                    idea_description=idea.description,
-                    best_score=best_score,
-                    scoring_dimensions=rubric.scoring_dimensions,
-                    time_budget=time_budget,
-                    model=model,
-                )
-                runtime = time.time() - t0
-
-                exp.approach = actor_result.get("approach", exp.approach)
-                exp.results = actor_result.get("results", "")
-                exp.stdout = actor_result.get("stdout", "")
-                exp.stderr = actor_result.get("stderr", "")
-                exp.diff = workspace.get_diff(wt)
-                exp.status = "success"
-
-                db.update_experiment(tasknum, **{
-                    "approach": exp.approach,
-                    "results": exp.results,
-                    "stdout": exp.stdout,
-                    "stderr": exp.stderr,
-                    "diff": exp.diff,
-                    "status": "success",
-                    "metadata": {**exp.metadata, "runtime_sec": runtime},
-                })
-
-                # Score
-                print(f"  Scoring...")
-                score = agents.score_experiment(rubric, exp)
-                if score is not None:
-                    db.update_experiment(tasknum, score=score, status="judged")
-                    improved = best_score is not None and score < best_score
-
-                    marker = " ★ NEW BEST" if improved else ""
-                    print(f"  Score: {score:.4f}{marker}")
-
-                    # Merge if improved
-                    if improved:
-                        workspace.commit_worktree(wt, f"auto: {idea.title}")
-                        if workspace.merge_worktree(codebase, wt):
-                            print(f"  Merged improvements into main branch.")
-                        else:
-                            print(f"  Merge conflict, keeping changes in branch only.")
-                else:
-                    print(f"  Could not score this experiment.")
-
-            except Exception as e:
-                runtime = time.time() - t0
-                db.update_experiment(tasknum, status="crash", stderr=str(e),
-                                     metadata={**exp.metadata, "runtime_sec": runtime})
-                print(f"  CRASH: {str(e)[:100]}")
-
-            finally:
-                workspace.cleanup_worktree(codebase, wt)
+                # Wait for all to complete (or shutdown)
+                for fut in concurrent.futures.as_completed(futures):
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        print(f"  Worker exception: {e}")
 
     # Final summary
     print("\n" + "=" * 60)
@@ -370,6 +416,8 @@ Examples:
                         help="Print experiment results and exit")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from last run")
+    parser.add_argument("--workers", "-w", type=int, default=1,
+                        help="Number of parallel workers (default: 1)")
 
     args = parser.parse_args()
 
@@ -415,7 +463,7 @@ Examples:
 
     # Phase 3: Loop
     phase_loop(db, rubric, codebase, args.time_budget, args.max_experiments,
-               args.model, ideas_per_batch)
+               args.model, ideas_per_batch, workers=args.workers)
 
     db.close()
 

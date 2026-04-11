@@ -7,6 +7,7 @@ without affecting the main branch or other concurrent experiments.
 import shutil
 import subprocess
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -90,10 +91,29 @@ def commit_worktree(worktree_path: str | Path, message: str) -> Optional[str]:
     return _run(["git", "rev-parse", "HEAD"], cwd=str(worktree_path))
 
 
-def merge_worktree(codebase: str | Path, worktree_path: str | Path) -> bool:
+@dataclass
+class MergeResult:
+    success: bool
+    branch: str = ""
+    main_branch: str = ""
+    error: str = ""
+    details: str = ""
+
+    def summary(self) -> str:
+        if self.success:
+            return f"Merged {self.branch} into {self.main_branch}"
+        parts = [f"Failed to merge {self.branch} into {self.main_branch}"]
+        if self.error:
+            parts.append(f"Error: {self.error}")
+        if self.details:
+            parts.append(f"Details: {self.details}")
+        return ". ".join(parts)
+
+
+def merge_worktree(codebase: str | Path, worktree_path: str | Path) -> MergeResult:
     """Merge the worktree's branch back into the main branch.
 
-    Returns True if merge succeeded.
+    Returns a MergeResult with details about what happened.
     """
     codebase = Path(codebase).resolve()
     worktree_path = Path(worktree_path)
@@ -110,16 +130,56 @@ def merge_worktree(codebase: str | Path, worktree_path: str | Path) -> bool:
         cwd=str(codebase),
     )
 
-    try:
-        _run(
-            ["git", "merge", branch, "--no-edit", "-m", f"auto: merge {branch}"],
-            cwd=str(codebase),
+    if main_branch == "HEAD":
+        return MergeResult(
+            success=False, branch=branch, main_branch=main_branch,
+            error="Main codebase is in detached HEAD state",
         )
-        return True
-    except RuntimeError:
-        # Merge conflict — abort
-        _run(["git", "merge", "--abort"], cwd=str(codebase), check=False)
-        return False
+
+    # Ensure no uncommitted changes to tracked files (untracked files are OK)
+    status = _run(["git", "diff", "--name-only"], cwd=str(codebase), check=False)
+    staged = _run(["git", "diff", "--cached", "--name-only"], cwd=str(codebase), check=False)
+    if status.strip() or staged.strip():
+        return MergeResult(
+            success=False, branch=branch, main_branch=main_branch,
+            error="Working directory has uncommitted changes to tracked files",
+            details=(status.strip() + " " + staged.strip())[:200],
+        )
+
+    # Try rebase onto latest HEAD first (reduces merge conflicts)
+    main_head = _run(["git", "rev-parse", "HEAD"], cwd=str(codebase))
+    rebase_result = subprocess.run(
+        ["git", "rebase", main_head],
+        capture_output=True, text=True, cwd=str(worktree_path), timeout=30,
+    )
+    if rebase_result.returncode != 0:
+        # Abort failed rebase, will try direct merge
+        subprocess.run(
+            ["git", "rebase", "--abort"],
+            capture_output=True, cwd=str(worktree_path), timeout=10,
+        )
+
+    # Attempt merge
+    merge_proc = subprocess.run(
+        ["git", "merge", branch, "--no-edit", "-m", f"auto: merge {branch}"],
+        capture_output=True, text=True, cwd=str(codebase), timeout=30,
+    )
+
+    if merge_proc.returncode == 0:
+        return MergeResult(success=True, branch=branch, main_branch=main_branch)
+
+    # Merge failed — gather details
+    conflict_files = _run(
+        ["git", "diff", "--name-only", "--diff-filter=U"],
+        cwd=str(codebase), check=False,
+    )
+    _run(["git", "merge", "--abort"], cwd=str(codebase), check=False)
+
+    return MergeResult(
+        success=False, branch=branch, main_branch=main_branch,
+        error="Merge conflict",
+        details=f"Conflicting files: {conflict_files}" if conflict_files else merge_proc.stderr[:300],
+    )
 
 
 def cleanup_worktree(codebase: str | Path, worktree_path: str | Path) -> None:
@@ -178,37 +238,65 @@ def cleanup_all_worktrees(codebase: str | Path) -> None:
     _run(["git", "worktree", "prune"], cwd=str(codebase), check=False)
 
 
+def _git_ls_files(codebase: Path) -> Optional[list[Path]]:
+    """List tracked files via git ls-files. Returns None if not a git repo."""
+    try:
+        output = _run(["git", "ls-files"], cwd=str(codebase), check=True)
+        if not output.strip():
+            return None
+        return [Path(line) for line in output.strip().split("\n") if line]
+    except (RuntimeError, subprocess.TimeoutExpired):
+        return None
+
+
 def scan_codebase(codebase: str | Path, max_files: int = 50, max_chars_per_file: int = 3000) -> str:
     """Create a summary of the codebase for the rubric agent.
 
     Returns a string with the file tree and truncated contents of key files.
+    Uses git ls-files when available to respect .gitignore.
     """
     codebase = Path(codebase).resolve()
     parts = []
 
-    # File tree (excluding .git, __pycache__, node_modules, .auto)
-    exclude = {".git", "__pycache__", "node_modules", ".auto", ".venv", "venv",
-               ".auto", "auto"}
-    files = []
-    for p in sorted(codebase.rglob("*")):
-        # Skip excluded directories
-        if any(ex in p.parts for ex in exclude):
-            continue
-        if p.is_file():
-            rel = p.relative_to(codebase)
-            files.append(rel)
+    # Try git ls-files first, fall back to rglob
+    git_files = _git_ls_files(codebase)
+    if git_files is not None:
+        files = sorted(git_files)
+    else:
+        exclude = {".git", "__pycache__", "node_modules", ".auto", ".venv", "venv"}
+        files = []
+        for p in sorted(codebase.rglob("*")):
+            if any(ex in p.parts for ex in exclude):
+                continue
+            if p.is_file():
+                files.append(p.relative_to(codebase))
 
+    # File tree
     parts.append("## File Tree\n```")
-    for f in files[:max_files * 2]:  # show more in tree than we read
+    for f in files[:max_files * 2]:
         parts.append(str(f))
     if len(files) > max_files * 2:
         parts.append(f"... and {len(files) - max_files * 2} more files")
     parts.append("```\n")
 
-    # Read key files (prioritize by extension)
-    priority_exts = {".py", ".js", ".ts", ".go", ".rs", ".java", ".rb", ".sh",
-                     ".yaml", ".yml", ".toml", ".json", ".md", ".txt"}
-    key_files = [f for f in files if f.suffix in priority_exts][:max_files]
+    # Prioritize source code > config > docs
+    high_priority = {".py", ".js", ".ts", ".go", ".rs", ".java", ".rb", ".sh"}
+    med_priority = {".yaml", ".yml", ".toml", ".json"}
+    low_priority = {".md", ".txt"}
+
+    def file_priority(f: Path) -> int:
+        if f.suffix in high_priority:
+            return 0
+        if f.suffix in med_priority:
+            return 1
+        if f.suffix in low_priority:
+            return 2
+        return 3
+
+    key_files = sorted(
+        [f for f in files if f.suffix in high_priority | med_priority | low_priority],
+        key=file_priority,
+    )[:max_files]
 
     parts.append("## Key File Contents\n")
     for f in key_files:

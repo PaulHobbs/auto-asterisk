@@ -8,10 +8,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-# Model aliases for clarity
-OPUS = "claude-opus-4-6"
-SONNET = "claude-sonnet-4-6"
-HAIKU = "claude-haiku-4-5-20251001"
+from .config import OPUS, SONNET, HAIKU
 
 
 @dataclass

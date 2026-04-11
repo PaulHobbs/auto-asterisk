@@ -26,9 +26,7 @@ import tempfile
 import time
 from pathlib import Path
 
-# Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
 
 from auto.db import DB
 
@@ -191,7 +189,7 @@ def verify_performance(project: Path, baseline_latency: float) -> dict:
     }
 
 
-def run_e2e(dry_run: bool = False):
+def run_e2e(dry_run: bool = False, model: str = None):
     """Run the full end-to-end test."""
     print("\n" + "=" * 60)
     print("  AUTO FRAMEWORK — END-TO-END TEST")
@@ -233,7 +231,7 @@ def run_e2e(dry_run: bool = False):
                 "--max-experiments", str(MAX_EXPERIMENTS),
                 "--time-budget", str(TIME_BUDGET),
                 "--ideas-per-batch", "2",
-            ],
+            ] + (["--model", model] if model else []),
             cwd=str(PROJECT_ROOT),
             timeout=MAX_EXPERIMENTS * (TIME_BUDGET + 180) + 300,  # generous timeout
             input="y\n",  # auto-approve rubric
@@ -310,7 +308,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="E2E test for auto framework")
     parser.add_argument("--dry-run", action="store_true",
                         help="Only verify fixture setup, don't run auto loop")
+    parser.add_argument("--model", default=None,
+                        help="Model override for cheaper E2E runs (e.g. claude-haiku-4-5-20251001)")
     args = parser.parse_args()
 
-    success = run_e2e(dry_run=args.dry_run)
+    success = run_e2e(dry_run=args.dry_run, model=args.model)
     sys.exit(0 if success else 1)

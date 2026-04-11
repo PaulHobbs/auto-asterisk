@@ -8,6 +8,7 @@ Schema:
 
 import json
 import sqlite3
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -53,7 +54,8 @@ class DB:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path))
+        self._lock = threading.Lock()
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self._init_schema()
@@ -103,20 +105,22 @@ class DB:
     # ── Rubric ──────────────────────────────────────────────
 
     def save_rubric(self, rubric: Rubric) -> int:
-        cur = self.conn.execute(
-            """INSERT INTO rubric (task_description, scoring_dimensions,
-               judge_prompt, setup_code, approved)
-               VALUES (?, ?, ?, ?, ?)""",
-            (rubric.task_description, rubric.scoring_dimensions,
-             rubric.judge_prompt, rubric.setup_code, int(rubric.approved)),
-        )
-        self.conn.commit()
-        return cur.lastrowid
+        with self._lock:
+            cur = self.conn.execute(
+                """INSERT INTO rubric (task_description, scoring_dimensions,
+                   judge_prompt, setup_code, approved)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (rubric.task_description, rubric.scoring_dimensions,
+                 rubric.judge_prompt, rubric.setup_code, int(rubric.approved)),
+            )
+            self.conn.commit()
+            return cur.lastrowid
 
     def get_rubric(self) -> Optional[Rubric]:
-        row = self.conn.execute(
-            "SELECT * FROM rubric WHERE approved = 1 ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM rubric WHERE approved = 1 ORDER BY id DESC LIMIT 1"
+            ).fetchone()
         if not row:
             return None
         return Rubric(
@@ -133,36 +137,55 @@ class DB:
         return self.get_rubric() is not None
 
     def approve_rubric(self, rubric_id: int):
-        self.conn.execute(
-            "UPDATE rubric SET approved = 1 WHERE id = ?", (rubric_id,)
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE rubric SET approved = 1 WHERE id = ?", (rubric_id,)
+            )
+            self.conn.commit()
 
     # ── Experiments ─────────────────────────────────────────
 
     def next_tasknum(self) -> int:
-        row = self.conn.execute(
-            "SELECT COALESCE(MAX(tasknum), -1) + 1 AS next FROM experiments"
-        ).fetchone()
-        return row["next"]
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(tasknum), -1) + 1 AS next FROM experiments"
+            ).fetchone()
+            return row["next"]
+
+    def reserve_tasknum(self, approach: str, status: str = "running") -> int:
+        """Atomically allocate a tasknum and insert a placeholder experiment."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(tasknum), -1) + 1 AS next FROM experiments"
+            ).fetchone()
+            tasknum = row["next"]
+            self.conn.execute(
+                """INSERT INTO experiments
+                   (tasknum, approach, status)
+                   VALUES (?, ?, ?)""",
+                (tasknum, approach, status),
+            )
+            self.conn.commit()
+            return tasknum
 
     def insert_experiment(self, exp: Experiment) -> int:
-        self.conn.execute(
-            """INSERT INTO experiments
-               (tasknum, parent_tasknum, approach, results, score, status,
-                stdout, stderr, diff, metadata)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (exp.tasknum, exp.parent_tasknum, exp.approach, exp.results,
-             exp.score, exp.status, exp.stdout, exp.stderr, exp.diff,
-             json.dumps(exp.metadata) if exp.metadata else None),
-        )
-        self.conn.commit()
-        return exp.tasknum
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO experiments
+                   (tasknum, parent_tasknum, approach, results, score, status,
+                    stdout, stderr, diff, metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (exp.tasknum, exp.parent_tasknum, exp.approach, exp.results,
+                 exp.score, exp.status, exp.stdout, exp.stderr, exp.diff,
+                 json.dumps(exp.metadata) if exp.metadata else None),
+            )
+            self.conn.commit()
+            return exp.tasknum
 
     def update_experiment(self, tasknum: int, **kwargs):
         """Update specific fields of an experiment row."""
         allowed = {
-            "results", "score", "status", "stdout", "stderr", "diff", "metadata"
+            "approach", "results", "score", "status", "stdout", "stderr", "diff", "metadata"
         }
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
@@ -171,59 +194,67 @@ class DB:
             updates["metadata"] = json.dumps(updates["metadata"])
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         values = list(updates.values()) + [tasknum]
-        self.conn.execute(
-            f"UPDATE experiments SET {set_clause} WHERE tasknum = ?", values
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                f"UPDATE experiments SET {set_clause} WHERE tasknum = ?", values
+            )
+            self.conn.commit()
 
     def get_experiment(self, tasknum: int) -> Optional[Experiment]:
-        row = self.conn.execute(
-            "SELECT * FROM experiments WHERE tasknum = ?", (tasknum,)
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM experiments WHERE tasknum = ?", (tasknum,)
+            ).fetchone()
         if not row:
             return None
         return self._row_to_experiment(row)
 
     def get_recent(self, limit: int = 20) -> list[Experiment]:
-        rows = self.conn.execute(
-            "SELECT * FROM experiments ORDER BY tasknum DESC LIMIT ?", (limit,)
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM experiments ORDER BY tasknum DESC LIMIT ?", (limit,)
+            ).fetchall()
         return [self._row_to_experiment(r) for r in rows]
 
     def get_best(self, n: int = 5) -> list[Experiment]:
         """Top N experiments by score (lowest = best). Only scored successes."""
-        rows = self.conn.execute(
-            """SELECT * FROM experiments
-               WHERE score IS NOT NULL AND status IN ('success', 'judged')
-               ORDER BY score ASC LIMIT ?""",
-            (n,),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT * FROM experiments
+                   WHERE score IS NOT NULL AND status IN ('success', 'judged')
+                   ORDER BY score ASC LIMIT ?""",
+                (n,),
+            ).fetchall()
         return [self._row_to_experiment(r) for r in rows]
 
     def get_worst(self, n: int = 5) -> list[Experiment]:
-        rows = self.conn.execute(
-            """SELECT * FROM experiments
-               WHERE score IS NOT NULL AND status IN ('success', 'judged')
-               ORDER BY score DESC LIMIT ?""",
-            (n,),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT * FROM experiments
+                   WHERE score IS NOT NULL AND status IN ('success', 'judged')
+                   ORDER BY score DESC LIMIT ?""",
+                (n,),
+            ).fetchall()
         return [self._row_to_experiment(r) for r in rows]
 
     def get_best_score(self) -> Optional[float]:
-        row = self.conn.execute(
-            """SELECT MIN(score) AS best FROM experiments
-               WHERE score IS NOT NULL AND status IN ('success', 'judged')"""
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT MIN(score) AS best FROM experiments
+                   WHERE score IS NOT NULL AND status IN ('success', 'judged')"""
+            ).fetchone()
         return row["best"] if row else None
 
     def count(self) -> int:
-        row = self.conn.execute("SELECT COUNT(*) AS n FROM experiments").fetchone()
+        with self._lock:
+            row = self.conn.execute("SELECT COUNT(*) AS n FROM experiments").fetchone()
         return row["n"]
 
     def get_all(self) -> list[Experiment]:
-        rows = self.conn.execute(
-            "SELECT * FROM experiments ORDER BY tasknum ASC"
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM experiments ORDER BY tasknum ASC"
+            ).fetchall()
         return [self._row_to_experiment(r) for r in rows]
 
     def _row_to_experiment(self, row: sqlite3.Row) -> Experiment:
@@ -252,19 +283,21 @@ class DB:
     # ── Director Log ────────────────────────────────────────
 
     def save_director_entry(self, entry: DirectorEntry) -> int:
-        cur = self.conn.execute(
-            """INSERT INTO director_log (after_tasknum, summary, patterns_json)
-               VALUES (?, ?, ?)""",
-            (entry.after_tasknum, entry.summary,
-             json.dumps(entry.patterns) if entry.patterns else None),
-        )
-        self.conn.commit()
-        return cur.lastrowid
+        with self._lock:
+            cur = self.conn.execute(
+                """INSERT INTO director_log (after_tasknum, summary, patterns_json)
+                   VALUES (?, ?, ?)""",
+                (entry.after_tasknum, entry.summary,
+                 json.dumps(entry.patterns) if entry.patterns else None),
+            )
+            self.conn.commit()
+            return cur.lastrowid
 
     def get_latest_director_entry(self) -> Optional[DirectorEntry]:
-        row = self.conn.execute(
-            "SELECT * FROM director_log ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM director_log ORDER BY id DESC LIMIT 1"
+            ).fetchone()
         if not row:
             return None
         patterns = row["patterns_json"]
