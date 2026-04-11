@@ -1,13 +1,11 @@
-"""Thin wrapper around Anthropic API with retries and structured output parsing."""
+"""Thin wrapper around the claude CLI with retries and structured output parsing."""
 
 import json
-import os
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 from typing import Optional
-
-import anthropic
 
 
 # Model aliases for clarity
@@ -15,15 +13,11 @@ OPUS = "claude-opus-4-6"
 SONNET = "claude-sonnet-4-6"
 HAIKU = "claude-haiku-4-5-20251001"
 
-DEFAULT_MAX_TOKENS = 4096
-
 
 @dataclass
 class LLMResponse:
     text: str
     model: str
-    input_tokens: int
-    output_tokens: int
 
 
 def call(
@@ -31,50 +25,36 @@ def call(
     *,
     model: str = SONNET,
     system: Optional[str] = None,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
+    max_tokens: int = 4096,
     temperature: float = 0.0,
     max_retries: int = 3,
 ) -> LLMResponse:
-    """Call the Anthropic API. Retries on transient errors."""
-    client = anthropic.Anthropic()  # uses ANTHROPIC_API_KEY env var
-
-    messages = [{"role": "user", "content": prompt}]
-    kwargs = dict(
-        model=model,
-        max_tokens=max_tokens,
-        messages=messages,
-        temperature=temperature,
-    )
+    """Call the claude CLI in print mode. Retries on transient errors."""
+    cmd = ["claude", "--print", "--model", model]
     if system:
-        kwargs["system"] = system
+        cmd.extend(["--system-prompt", system])
+    cmd.extend(["-p", prompt])
 
     last_error = None
     for attempt in range(max_retries):
         try:
-            response = client.messages.create(**kwargs)
-            return LLMResponse(
-                text=response.content[0].text,
-                model=response.model,
-                input_tokens=response.usage.input_tokens,
-                output_tokens=response.usage.output_tokens,
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=300,
+                stdin=subprocess.DEVNULL,
             )
-        except anthropic.RateLimitError as e:
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"claude CLI exited with code {result.returncode}: "
+                    f"{result.stderr[:500]}"
+                )
+            return LLMResponse(text=result.stdout, model=model)
+        except subprocess.TimeoutExpired as e:
             last_error = e
-            wait = min(2 ** attempt * 5, 60)
-            print(f"  [llm] Rate limited, waiting {wait}s...")
-            time.sleep(wait)
-        except anthropic.APIStatusError as e:
-            if e.status_code >= 500:
-                last_error = e
-                wait = 2 ** attempt
-                print(f"  [llm] Server error {e.status_code}, retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                raise
-        except anthropic.APIConnectionError as e:
+            print(f"  [llm] Timeout, retrying ({attempt + 1}/{max_retries})...")
+        except RuntimeError as e:
             last_error = e
-            wait = 2 ** attempt
-            print(f"  [llm] Connection error, retrying in {wait}s...")
+            wait = 2 ** attempt * 2
+            print(f"  [llm] Error, retrying in {wait}s: {e}")
             time.sleep(wait)
 
     raise RuntimeError(f"LLM call failed after {max_retries} retries: {last_error}")

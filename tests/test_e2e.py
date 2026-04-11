@@ -216,12 +216,6 @@ def run_e2e(dry_run: bool = False):
             print("\n[DRY RUN] Skipping auto loop. Setup verified.")
             return True
 
-        # Check for API key
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            print("\n  ERROR: ANTHROPIC_API_KEY not set. Cannot run e2e test.")
-            print("  Set it and rerun, or use --dry-run to verify setup only.")
-            return False
-
         # Run auto loop
         print(f"\n[3/6] Running auto loop (max {MAX_EXPERIMENTS} experiments)...")
         print(f"  Time budget per experiment: {TIME_BUDGET}s")
