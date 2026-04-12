@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import llm
-from .config import SONNET
+from .config import SONNET, PROVIDER
 from .db import DB, DirectorEntry, Experiment, Rubric
 
 log = logging.getLogger(__name__)
@@ -112,6 +112,20 @@ IMPORTANT:
 """
 
 
+def _build_actor_cmd(prompt: str, model: str, max_turns: int, provider: str) -> list[str]:
+    """Build the bare actor CLI command (without safehouse wrapper)."""
+    if provider == "gemini":
+        return ["gemini", "--yolo", "-m", model, "-p", prompt]
+    else:
+        return [
+            "claude",
+            "-p", prompt,
+            "--dangerously-skip-permissions",
+            "--model", model,
+            "--max-turns", str(max_turns),
+        ]
+
+
 def run_actor(
     worktree_path: str | Path,
     idea_description: str,
@@ -120,11 +134,13 @@ def run_actor(
     time_budget: int = 300,
     model: str = SONNET,
     max_turns: int = 30,
+    provider: Optional[str] = None,
 ) -> dict:
-    """Run the actor agent as a claude CLI subprocess.
+    """Run the actor agent as a CLI subprocess (claude or gemini).
 
     Returns a dict with keys: approach, results, metrics, stdout, stderr, returncode.
     """
+    prov = provider or PROVIDER
     worktree_path = Path(worktree_path).resolve()
 
     prompt = ACTOR_PROMPT.format(
@@ -132,6 +148,8 @@ def run_actor(
         best_score=f"{best_score:.4f}" if best_score is not None else "N/A (baseline)",
         scoring_dimensions=scoring_dimensions,
     )
+
+    bare_cmd = _build_actor_cmd(prompt, model, max_turns, prov)
 
     _local_overrides = Path(__file__).parent / "safehouse" / "local-overrides.sb"
     cmd = [
@@ -141,24 +159,10 @@ def run_actor(
     _user_profile = os.environ.get("SAFEHOUSE_APPEND_PROFILE")
     if _user_profile:
         cmd.append(f"--append-profile={_user_profile}")
-    cmd += [
-        "--",
-        "claude",
-        "-p", prompt,
-        "--dangerously-skip-permissions",
-        "--model", model,
-        "--max-turns", str(max_turns),
-    ]
+    cmd += ["--"] + bare_cmd
 
-    claude_cmd = [
-        "claude",
-        "-p", prompt,
-        "--dangerously-skip-permissions",
-        "--model", model,
-        "--max-turns", str(max_turns),
-    ]
-
-    log.info(f"[actor] Running in {worktree_path}")
+    cli_name = "gemini" if prov == "gemini" else "claude"
+    log.info(f"[actor] Running {cli_name} in {worktree_path}")
     try:
         result = subprocess.run(
             cmd,
@@ -166,6 +170,7 @@ def run_actor(
             text=True,
             cwd=str(worktree_path),
             timeout=time_budget + 120,  # extra buffer for LLM calls
+            stdin=subprocess.DEVNULL,
         )
         # Safehouse failed to apply sandbox — fall back to running without it
         if result.returncode != 0 and "sandbox" in (result.stderr or "").lower():
@@ -174,11 +179,12 @@ def run_actor(
                 "retrying without sandbox."
             )
             result = subprocess.run(
-                claude_cmd,
+                bare_cmd,
                 capture_output=True,
                 text=True,
                 cwd=str(worktree_path),
                 timeout=time_budget + 120,
+                stdin=subprocess.DEVNULL,
             )
         stdout = result.stdout
         stderr = result.stderr
@@ -189,9 +195,11 @@ def run_actor(
         returncode = -1
     except FileNotFoundError:
         raise RuntimeError(
-            "safehouse or claude CLI not found. Install safehouse with: "
+            f"safehouse or {cli_name} CLI not found. Install safehouse with: "
             "brew install eugene1g/safehouse/agent-safehouse — "
-            "Install claude with: npm install -g @anthropic-ai/claude-code"
+            f"Install {cli_name} with: "
+            + ("npm install -g @anthropic-ai/claude-code" if prov == "claude"
+               else "npm install -g @anthropic-ai/claude-code or brew install gemini-cli")
         )
 
     # Parse the actor's JSON output from stdout

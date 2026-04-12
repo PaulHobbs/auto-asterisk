@@ -1,4 +1,4 @@
-"""Thin wrapper around the claude CLI with retries and structured output parsing."""
+"""Thin wrapper around the claude/gemini CLI with retries and structured output parsing."""
 
 import json
 import logging
@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-from .config import OPUS, SONNET, HAIKU
+from .config import OPUS, SONNET, HAIKU, PROVIDER
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +20,30 @@ class LLMResponse:
     model: str
 
 
+def _build_cmd(
+    prompt: str,
+    model: str,
+    system: Optional[str],
+    provider: str,
+) -> list[str]:
+    """Build the CLI command for the given provider."""
+    if provider == "gemini":
+        # Gemini CLI: gemini --yolo -m MODEL -p PROMPT
+        # No --system-prompt flag; prepend system instructions to the prompt.
+        full_prompt = prompt
+        if system:
+            full_prompt = f"[System instructions — follow these exactly]\n{system}\n[End system instructions]\n\n{prompt}"
+        cmd = ["gemini", "--yolo", "-m", model, "-p", full_prompt]
+        return cmd
+    else:
+        # Claude CLI: claude --print --model MODEL -p PROMPT
+        cmd = ["claude", "--print", "--model", model]
+        if system:
+            cmd.extend(["--system-prompt", system])
+        cmd.extend(["-p", prompt])
+        return cmd
+
+
 def call(
     prompt: str,
     *,
@@ -28,12 +52,12 @@ def call(
     max_tokens: int = 4096,
     temperature: float = 0.0,
     max_retries: int = 3,
+    provider: Optional[str] = None,
 ) -> LLMResponse:
-    """Call the claude CLI in print mode. Retries on transient errors."""
-    cmd = ["claude", "--print", "--model", model]
-    if system:
-        cmd.extend(["--system-prompt", system])
-    cmd.extend(["-p", prompt])
+    """Call the LLM CLI in non-interactive mode. Retries on transient errors."""
+    prov = provider or PROVIDER
+    cmd = _build_cmd(prompt, model, system, prov)
+    cli_name = "gemini" if prov == "gemini" else "claude"
 
     last_error = None
     for attempt in range(max_retries):
@@ -44,7 +68,7 @@ def call(
             )
             if result.returncode != 0:
                 raise RuntimeError(
-                    f"claude CLI exited with code {result.returncode}: "
+                    f"{cli_name} CLI exited with code {result.returncode}: "
                     f"{result.stderr[:500]}"
                 )
             return LLMResponse(text=result.stdout, model=model)

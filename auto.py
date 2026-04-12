@@ -473,8 +473,26 @@ Examples:
                         help="Resume from last run")
     parser.add_argument("--workers", "-w", type=int, default=1,
                         help="Number of parallel workers (default: 1)")
+    parser.add_argument("--provider", choices=["claude", "gemini"],
+                        help="LLM provider (default: auto-detect from CLI availability)")
 
     args = parser.parse_args()
+
+    # Override provider for the whole process if specified
+    if args.provider:
+        os.environ["AUTO_PROVIDER"] = args.provider
+        # Update module-level PROVIDER in all modules that imported it
+        from auto import config
+        import importlib
+        importlib.reload(config)
+        # Re-import into llm and agents so their module-level bindings update
+        from auto import llm as _llm_mod, agents as _agents_mod
+        _llm_mod.PROVIDER = config.PROVIDER
+        _llm_mod.OPUS = config.OPUS
+        _llm_mod.SONNET = config.SONNET
+        _llm_mod.HAIKU = config.HAIKU
+        _agents_mod.PROVIDER = config.PROVIDER
+        _agents_mod.SONNET = config.SONNET
 
     logging.basicConfig(
         format="%(asctime)s %(levelname)-7s %(message)s",

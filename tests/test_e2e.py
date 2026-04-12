@@ -407,8 +407,14 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true",
                         help="Only verify fixture setup, don't run auto loop")
     parser.add_argument("--model", default=None,
-                        help="Model override for cheaper E2E runs (e.g. claude-haiku-4-5-20251001)")
+                        help="Model override (e.g. gemini-2.5-flash, claude-haiku-4-5-20251001)")
+    parser.add_argument("--provider", default=None, choices=["claude", "gemini"],
+                        help="LLM provider (default: auto-detect)")
     args = parser.parse_args()
+
+    # Set provider for the whole process if specified
+    if args.provider:
+        os.environ["AUTO_PROVIDER"] = args.provider
 
     success = run_e2e(dry_run=args.dry_run, model=args.model)
     sys.exit(0 if success else 1)

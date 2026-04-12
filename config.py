@@ -4,6 +4,7 @@ All constants are overridable via AUTO_-prefixed environment variables.
 """
 
 import os
+import shutil
 import sys
 
 
@@ -24,10 +25,31 @@ def _int_env(name: str, default: str) -> int:
         return int(default)
 
 
+# ── Provider detection ───────────────────────────────────────────────────
+# AUTO_PROVIDER = "claude" | "gemini"  (auto-detected from CLI availability)
+def _detect_provider() -> str:
+    explicit = os.environ.get("AUTO_PROVIDER", "").lower()
+    if explicit in ("claude", "gemini"):
+        return explicit
+    # Auto-detect: prefer claude if available, fall back to gemini
+    if shutil.which("claude"):
+        return "claude"
+    if shutil.which("gemini"):
+        return "gemini"
+    return "claude"  # default; will fail at runtime with a clear error
+
+
+PROVIDER = _detect_provider()
+
 # ── Model aliases ────────────────────────────────────────────────────────
-OPUS = os.environ.get("AUTO_MODEL_OPUS", "claude-opus-4-6")
-SONNET = os.environ.get("AUTO_MODEL_SONNET", "claude-sonnet-4-6")
-HAIKU = os.environ.get("AUTO_MODEL_HAIKU", "claude-haiku-4-5-20251001")
+if PROVIDER == "gemini":
+    OPUS = os.environ.get("AUTO_MODEL_OPUS", "gemini-2.5-pro")
+    SONNET = os.environ.get("AUTO_MODEL_SONNET", "gemini-2.5-flash")
+    HAIKU = os.environ.get("AUTO_MODEL_HAIKU", "gemini-2.5-flash")
+else:
+    OPUS = os.environ.get("AUTO_MODEL_OPUS", "claude-opus-4-6")
+    SONNET = os.environ.get("AUTO_MODEL_SONNET", "claude-sonnet-4-6")
+    HAIKU = os.environ.get("AUTO_MODEL_HAIKU", "claude-haiku-4-5-20251001")
 
 # ── Orchestrator defaults ────────────────────────────────────────────────
 WORK_DIR = os.environ.get("AUTO_WORK_DIR", ".auto")
