@@ -27,6 +27,15 @@ from auto.config import (
     WORK_DIR, DB_FILE, DIRECTOR_INTERVAL, IDEAS_PER_BATCH,
     DEFAULT_TIME_BUDGET, DEFAULT_MAX_EXPERIMENTS, DEFAULT_MODEL,
 )
+from auto.quota import PersistentQuotaError, QuotaPolicy
+from auto.session_db import (
+    SessionDB, SessionRecord, open_or_create_session,
+    session_id_for, find_session_by_codebase,
+)
+from auto.config import (
+    QUOTA_CONSECUTIVE_THRESHOLD, QUOTA_WINDOW_SECONDS,
+    QUOTA_WINDOW_THRESHOLD, QUOTA_MAX_BACKOFF,
+)
 
 
 log = logging.getLogger("auto")
@@ -346,6 +355,9 @@ def _run_single_experiment(
         else:
             log.warning(f"[#{tasknum}] Could not score this experiment.")
 
+    except PersistentQuotaError:
+        raise  # Let quota hibernation propagate (finally handles cleanup)
+
     except Exception as e:
         runtime = time.time() - t0
         db.update_experiment(tasknum, status="crash", stderr=str(e),
@@ -354,6 +366,14 @@ def _run_single_experiment(
 
     finally:
         workspace.cleanup_worktree(codebase, wt)
+
+
+def _save_loop_state(session_db, session_id, director_summary):
+    """Persist loop state to session DB for resume."""
+    if session_db and session_id:
+        session_db.set_phase(session_id, "loop", {
+            "loop": {"director_summary": director_summary},
+        })
 
 
 def phase_loop(
@@ -365,18 +385,23 @@ def phase_loop(
     model: str,
     ideas_per_batch: int = IDEAS_PER_BATCH,
     workers: int = 1,
+    session_db: SessionDB = None,
+    session_id: str = None,
+    initial_director_summary: str = None,
 ) -> None:
     """Phase 3: Main experiment loop."""
+    global _shutdown_requested
     log.info("=" * 60)
     log.info("PHASE 3: EXPERIMENT LOOP")
     if workers > 1:
         log.info(f"Workers: {workers}")
     log.info("=" * 60)
 
-    director_summary = "No analysis yet. This is the first batch of experiments."
+    director_summary = initial_director_summary or "No analysis yet. This is the first batch of experiments."
 
     while True:
         if _shutdown_requested:
+            _save_loop_state(session_db, session_id, director_summary)
             break
 
         current_count = db.count()
@@ -387,55 +412,131 @@ def phase_loop(
         # ── Director (every N experiments) ──────────────────────
         if current_count > 0 and current_count % DIRECTOR_INTERVAL == 0:
             log.info(f"[director] Analyzing {current_count} experiments...")
-            entry = agents.run_director(db, rubric)
-            db.save_director_entry(entry)
-            director_summary = entry.summary
-            log.info("[director] Summary saved.")
+            try:
+                entry = agents.run_director(db, rubric)
+                db.save_director_entry(entry)
+                director_summary = entry.summary
+                log.info("[director] Summary saved.")
 
-            # Print patterns if available
-            if entry.patterns:
-                if entry.patterns.get("working"):
-                    log.info(f"[director] Working: {entry.patterns['working'][:2]}")
-                if entry.patterns.get("next_direction"):
-                    log.info(f"[director] Next: {entry.patterns['next_direction'][:80]}")
+                # Print patterns if available
+                if entry.patterns:
+                    if entry.patterns.get("working"):
+                        log.info(f"[director] Working: {entry.patterns['working'][:2]}")
+                    if entry.patterns.get("next_direction"):
+                        log.info(f"[director] Next: {entry.patterns['next_direction'][:80]}")
+            except PersistentQuotaError:
+                _save_loop_state(session_db, session_id, director_summary)
+                _hibernate_session(session_db, session_id)
+                return
 
-        # ── Idea Generation ─────────────────────────────────────
-        log.info(f"[idea-gen] Generating {ideas_per_batch} ideas...")
-        ideas = agents.generate_ideas(db, rubric, director_summary, ideas_per_batch)
+        # ── Drain persisted idea queue first (for resume) ──────
+        ideas = _drain_or_generate_ideas(
+            db, rubric, director_summary, ideas_per_batch,
+            session_db, session_id,
+        )
+        if ideas is None:
+            # PersistentQuotaError during idea generation
+            return
+
         log.info(f"[idea-gen] Got {len(ideas)} ideas:")
         for i, idea in enumerate(ideas):
             log.info(f"  {i+1}. {idea.title} ({idea.risk} risk)")
 
         # ── Run experiments (parallel if workers > 1) ──────────
-        if workers <= 1:
-            for idea in ideas:
-                if _shutdown_requested:
-                    break
-                _run_single_experiment(db, rubric, codebase, idea, time_budget, model)
-        else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = []
+        try:
+            if workers <= 1:
                 for idea in ideas:
                     if _shutdown_requested:
                         break
-                    fut = executor.submit(
-                        _run_single_experiment, db, rubric, codebase,
-                        idea, time_budget, model,
-                    )
-                    futures.append(fut)
+                    _run_single_experiment(db, rubric, codebase, idea, time_budget, model)
+                    _mark_idea_done(session_db, idea)
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = {}
+                    for idea in ideas:
+                        if _shutdown_requested:
+                            break
+                        fut = executor.submit(
+                            _run_single_experiment, db, rubric, codebase,
+                            idea, time_budget, model,
+                        )
+                        futures[fut] = idea
 
-                # Wait for all to complete (or shutdown)
-                for fut in concurrent.futures.as_completed(futures):
-                    try:
-                        fut.result()
-                    except Exception as e:
-                        log.error(f"Worker exception: {e}")
+                    # Wait for all to complete (or shutdown)
+                    for fut in concurrent.futures.as_completed(futures):
+                        try:
+                            fut.result()
+                            _mark_idea_done(session_db, futures[fut])
+                        except PersistentQuotaError:
+                            # Signal other workers to stop
+                            _shutdown_requested = True
+                            raise
+                        except Exception as e:
+                            _mark_idea_done(session_db, futures[fut])
+                            log.error(f"Worker exception: {e}")
+
+        except PersistentQuotaError:
+            _save_loop_state(session_db, session_id, director_summary)
+            _hibernate_session(session_db, session_id)
+            return
 
     # Final summary
     log.info("=" * 60)
     log.info("DONE")
     log.info("=" * 60)
     db.print_summary()
+
+
+def _drain_or_generate_ideas(db, rubric, director_summary, ideas_per_batch,
+                              session_db, session_id):
+    """Drain persisted idea queue or generate new ideas. Returns ideas or None on quota error."""
+    # Check for pending ideas from a previous session (resume case)
+    if session_db and session_id:
+        pending = session_db.get_pending_ideas(session_id, limit=ideas_per_batch)
+        if pending:
+            log.info(f"[idea-gen] Resuming {len(pending)} ideas from previous session.")
+            ideas = []
+            for rec in pending:
+                idea = agents.Idea(
+                    title=rec.title, description=rec.description,
+                    rationale=rec.rationale, risk=rec.risk,
+                )
+                idea._queue_id = rec.id  # Track queue ID for dispatch marking
+                ideas.append(idea)
+            return ideas
+
+    # Generate fresh ideas
+    log.info(f"[idea-gen] Generating {ideas_per_batch} ideas...")
+    try:
+        ideas = agents.generate_ideas(db, rubric, director_summary, ideas_per_batch)
+    except PersistentQuotaError:
+        _save_loop_state(session_db, session_id, director_summary)
+        _hibernate_session(session_db, session_id)
+        return None
+
+    # Persist to session queue before dispatching (enables resume mid-batch)
+    if session_db and session_id:
+        session_db.enqueue_ideas(session_id, ideas)
+        # Assign queue IDs to ideas so they can be marked dispatched after completion
+        pending = session_db.get_pending_ideas(session_id, limit=ideas_per_batch)
+        for idea, rec in zip(ideas, pending):
+            idea._queue_id = rec.id
+
+    return ideas
+
+
+def _mark_idea_done(session_db, idea):
+    """Mark an idea as dispatched in the session queue after experiment completes."""
+    if session_db and hasattr(idea, '_queue_id'):
+        session_db.mark_idea_dispatched(idea._queue_id)
+
+
+def _hibernate_session(session_db, session_id):
+    """Mark session as hibernated and log instructions."""
+    if session_db and session_id:
+        session_db.mark_hibernated(session_id)
+    log.error("Persistent quota limit reached. Session hibernated.")
+    log.info("Resume with: auto --resume")
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────
@@ -475,6 +576,10 @@ Examples:
                         help="Number of parallel workers (default: 1)")
     parser.add_argument("--provider", choices=["claude", "gemini"],
                         help="LLM provider (default: auto-detect from CLI availability)")
+    parser.add_argument("--session-name", "-s",
+                        help="Named session for this run (default: auto-derived)")
+    parser.add_argument("--list-sessions", action="store_true",
+                        help="List all sessions for this codebase and exit")
 
     args = parser.parse_args()
 
@@ -513,12 +618,29 @@ Examples:
         db.print_summary()
         sys.exit(0)
 
+    # --list-sessions: show sessions for this codebase
+    if args.list_sessions:
+        _list_sessions(codebase)
+        sys.exit(0)
+
     # Need a task (or --resume with existing rubric)
     if not args.task and not args.resume:
         parser.print_help()
         sys.exit(1)
 
+    # ── Resume flow ─────────────────────────────────────────────
+    session_db = None
+    session_id = None
+    initial_director_summary = None
+    resume_phase = None
+
     if args.resume:
+        # Try session-based resume first
+        session_db, session_id, resume_phase, initial_director_summary = (
+            _resume_session(codebase, args.session_name)
+        )
+
+        # Fall back to legacy rubric-only resume
         rubric = db.get_rubric()
         if not rubric:
             log.error("No existing rubric found. Cannot resume.")
@@ -529,22 +651,122 @@ Examples:
     else:
         task = args.task
 
+    # ── Session bringup ─────────────────────────────────────────
+    if session_db is None:
+        sid = args.session_name or session_id_for(codebase, task)
+        session_db, session_record = open_or_create_session(
+            session_id=sid,
+            codebase_path=codebase,
+            task_description=task,
+            cli_args=vars(args),
+            experiments_db_path=work / DB_FILE,
+        )
+        session_id = sid
+
     ideas_per_batch = args.ideas_per_batch
 
     # Ensure git repo
     workspace.ensure_git_repo(codebase)
 
-    # Phase 1: Rubric
-    rubric = phase_rubric(db, task, codebase)
+    try:
+        # Phase 1: Rubric (idempotent — checks DB)
+        rubric = phase_rubric(db, task, codebase)
+        session_db.set_phase(session_id, "baseline")
 
-    # Phase 2: Baseline
-    phase_baseline(db, rubric, codebase, args.time_budget)
+        # Phase 2: Baseline (idempotent — checks db.count())
+        if resume_phase not in ("loop", "done"):
+            phase_baseline(db, rubric, codebase, args.time_budget)
+        session_db.set_phase(session_id, "loop")
 
-    # Phase 3: Loop
-    phase_loop(db, rubric, codebase, args.time_budget, args.max_experiments,
-               args.model, ideas_per_batch, workers=args.workers)
+        # Phase 3: Loop
+        phase_loop(db, rubric, codebase, args.time_budget, args.max_experiments,
+                   args.model, ideas_per_batch, workers=args.workers,
+                   session_db=session_db, session_id=session_id,
+                   initial_director_summary=initial_director_summary)
 
-    db.close()
+        # Mark complete unless hibernated (phase_loop handles that internally)
+        session = session_db.get_session(session_id)
+        if session and session.status == "active":
+            session_db.mark_complete(session_id)
+
+    except PersistentQuotaError as e:
+        log.error(f"Persistent quota error: {e}")
+        _hibernate_session(session_db, session_id)
+
+    except Exception:
+        if session_db and session_id:
+            session_db.mark_crashed(session_id)
+        raise
+
+    finally:
+        if session_db:
+            session_db.close()
+        db.close()
+
+
+def _resume_session(codebase, session_name=None):
+    """Attempt session-based resume. Returns (session_db, session_id, phase, director_summary)."""
+    if session_name:
+        from auto.session_db import session_db_path
+        db_path = session_db_path(session_name)
+        if db_path.exists():
+            sdb = SessionDB(db_path)
+            record = sdb.get_session(session_name)
+            if record:
+                if record.status == "hibernated":
+                    log.info(f"Resuming hibernated session {session_name[:8]} (was quota-limited).")
+                    sdb.update_session(session_name, status="active")
+                phase_data = record.phase_data or {}
+                director_summary = phase_data.get("loop", {}).get("director_summary")
+                return sdb, session_name, record.current_phase, director_summary
+            sdb.close()
+    else:
+        result = find_session_by_codebase(codebase)
+        if result:
+            sid, sdb = result
+            record = sdb.get_session(sid)
+            if record:
+                if record.status == "hibernated":
+                    log.info(f"Resuming hibernated session {sid[:8]} (was quota-limited).")
+                    sdb.update_session(sid, status="active")
+                phase_data = record.phase_data or {}
+                director_summary = phase_data.get("loop", {}).get("director_summary")
+                return sdb, sid, record.current_phase, director_summary
+            sdb.close()
+
+    return None, None, None, None
+
+
+def _list_sessions(codebase):
+    """List all sessions for the given codebase."""
+    import sqlite3 as _sqlite3
+    from auto.session_db import sessions_dir
+    sdir = sessions_dir()
+    abs_codebase = str(codebase.resolve())
+    found = []
+    for db_file in sdir.glob("*.db"):
+        try:
+            conn = _sqlite3.connect(str(db_file))
+            conn.row_factory = _sqlite3.Row
+            row = conn.execute(
+                "SELECT id, status, current_phase, updated_at FROM session WHERE codebase_path = ?",
+                (abs_codebase,),
+            ).fetchone()
+            conn.close()
+            if row:
+                found.append(dict(row))
+        except Exception:
+            continue
+
+    if not found:
+        print("No sessions found for this codebase.")
+        return
+
+    found.sort(key=lambda r: r.get("updated_at", ""), reverse=True)
+    print(f"{'ID':<18} {'Status':<12} {'Phase':<10} {'Updated'}")
+    print("-" * 60)
+    for r in found:
+        print(f"{r['id']:<18} {r['status']:<12} {r['current_phase']:<10} {r.get('updated_at', 'N/A')}")
 
 
 if __name__ == "__main__":

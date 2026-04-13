@@ -16,6 +16,7 @@ from typing import Optional
 from . import llm
 from .config import SONNET, PROVIDER
 from .db import DB, DirectorEntry, Experiment, Rubric
+from .quota import PersistentQuotaError
 
 log = logging.getLogger(__name__)
 
@@ -305,6 +306,8 @@ Score this experiment. Respond with ONLY: {{"score": <float>}}
             score = llm.extract_float(response.text)
             if score is not None:
                 return score
+        except PersistentQuotaError:
+            raise  # Let quota hibernation propagate
         except Exception as e:
             if attempt == 2:
                 log.error(f"[judge] Failed to score after 3 attempts: {e}")

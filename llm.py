@@ -6,10 +6,14 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Optional
-
+from datetime import datetime
+from typing import Callable, Optional
 
 from .config import OPUS, SONNET, HAIKU, PROVIDER
+from .quota import (
+    QuotaPolicy, QuotaState, PersistentQuotaError,
+    detect_quota_signal, should_hibernate, backoff_for_quota,
+)
 
 log = logging.getLogger(__name__)
 
@@ -53,11 +57,19 @@ def call(
     temperature: float = 0.0,
     max_retries: int = 3,
     provider: Optional[str] = None,
+    quota_policy: Optional[QuotaPolicy] = None,
+    on_quota_error: Optional[Callable[[str, str], None]] = None,
 ) -> LLMResponse:
     """Call the LLM CLI in non-interactive mode. Retries on transient errors."""
     prov = provider or PROVIDER
     cmd = _build_cmd(prompt, model, system, prov)
     cli_name = "gemini" if prov == "gemini" else "claude"
+
+    # When quota policy is set, ensure we have enough retries to reach the hibernate threshold.
+    if quota_policy is not None:
+        max_retries = max(max_retries, quota_policy.consecutive_errors_threshold + 2)
+
+    state = QuotaState() if quota_policy is not None else None
 
     last_error = None
     for attempt in range(max_retries):
@@ -67,6 +79,37 @@ def call(
                 stdin=subprocess.DEVNULL,
             )
             if result.returncode != 0:
+                if quota_policy is not None:
+                    signal = detect_quota_signal(result.stderr, result.stdout)
+                    if signal.is_quota_error:
+                        if on_quota_error is not None:
+                            on_quota_error(result.stderr, model)
+                        state.consecutive_quota_errors += 1
+                        state.quota_error_timestamps.append(datetime.utcnow())
+                        if should_hibernate(state, quota_policy):
+                            raise PersistentQuotaError(
+                                f"Persistent quota errors for model {model} after "
+                                f"{state.consecutive_quota_errors} consecutive failures",
+                                retry_after=signal.retry_after_seconds,
+                            )
+                        wait = backoff_for_quota(
+                            state.consecutive_quota_errors,
+                            quota_policy,
+                            signal.retry_after_seconds,
+                        )
+                        log.warning(
+                            f"[llm] Quota error, backing off {wait}s "
+                            f"(consecutive={state.consecutive_quota_errors})"
+                        )
+                        time.sleep(wait)
+                        last_error = RuntimeError(
+                            f"{cli_name} CLI exited with code {result.returncode}: "
+                            f"{result.stderr[:500]}"
+                        )
+                        continue
+                    else:
+                        # Non-quota error — reset consecutive quota counter
+                        state.consecutive_quota_errors = 0
                 raise RuntimeError(
                     f"{cli_name} CLI exited with code {result.returncode}: "
                     f"{result.stderr[:500]}"
@@ -74,7 +117,21 @@ def call(
             return LLMResponse(text=result.stdout, model=model)
         except subprocess.TimeoutExpired as e:
             last_error = e
+            if quota_policy is not None:
+                # Long timeouts are common during quota issues; check what we have
+                signal = detect_quota_signal(getattr(e, "stderr", "") or "", "")
+                if signal.is_quota_error:
+                    if on_quota_error is not None:
+                        on_quota_error(str(e), model)
+                    state.consecutive_quota_errors += 1
+                    state.quota_error_timestamps.append(datetime.utcnow())
+                    if should_hibernate(state, quota_policy):
+                        raise PersistentQuotaError(
+                            f"Persistent quota errors (timeout) for model {model}",
+                        )
             log.warning(f"[llm] Timeout, retrying ({attempt + 1}/{max_retries})...")
+        except PersistentQuotaError:
+            raise
         except RuntimeError as e:
             last_error = e
             wait = 2 ** attempt * 2

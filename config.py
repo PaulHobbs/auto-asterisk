@@ -6,6 +6,7 @@ All constants are overridable via AUTO_-prefixed environment variables.
 import os
 import shutil
 import sys
+from pathlib import Path
 
 
 def _int_env(name: str, default: str) -> int:
@@ -43,9 +44,9 @@ PROVIDER = _detect_provider()
 
 # ── Model aliases ────────────────────────────────────────────────────────
 if PROVIDER == "gemini":
-    OPUS = os.environ.get("AUTO_MODEL_OPUS", "gemini-2.5-pro")
-    SONNET = os.environ.get("AUTO_MODEL_SONNET", "gemini-2.5-flash")
-    HAIKU = os.environ.get("AUTO_MODEL_HAIKU", "gemini-2.5-flash")
+    OPUS = os.environ.get("AUTO_MODEL_OPUS", "gemini-3.1-pro-preview")
+    SONNET = os.environ.get("AUTO_MODEL_SONNET", "gemini-3-flash-preview")
+    HAIKU = os.environ.get("AUTO_MODEL_HAIKU", "gemini-3.1-flash-lite-preview")
 else:
     OPUS = os.environ.get("AUTO_MODEL_OPUS", "claude-opus-4-6")
     SONNET = os.environ.get("AUTO_MODEL_SONNET", "claude-sonnet-4-6")
@@ -64,3 +65,15 @@ DEFAULT_MODEL = os.environ.get("AUTO_DEFAULT_MODEL", SONNET)
 GIT_TIMEOUT = _int_env("AUTO_GIT_TIMEOUT", "30")
 LLM_TIMEOUT = _int_env("AUTO_LLM_TIMEOUT", "300")
 SETUP_TIMEOUT = _int_env("AUTO_SETUP_TIMEOUT", "120")
+
+# ── Session store ─────────────────────────────────────────────────────────
+SESSIONS_DIR = Path(os.environ.get(
+    "AUTO_SESSIONS_DIR",
+    str(Path.home() / ".auto-asterisk" / "sessions"),
+))
+
+# ── Quota policy defaults ─────────────────────────────────────────────────
+QUOTA_CONSECUTIVE_THRESHOLD = _int_env("AUTO_QUOTA_CONSECUTIVE", "3")
+QUOTA_WINDOW_SECONDS = _int_env("AUTO_QUOTA_WINDOW_SECONDS", "300")
+QUOTA_WINDOW_THRESHOLD = _int_env("AUTO_QUOTA_WINDOW_ERRORS", "5")
+QUOTA_MAX_BACKOFF = _int_env("AUTO_QUOTA_MAX_BACKOFF", "600")
