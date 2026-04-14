@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -48,6 +49,61 @@ def _build_cmd(
         return cmd
 
 
+def _stream_subprocess(
+    cmd: list[str],
+    *,
+    cwd: Optional[str] = None,
+    timeout: int = 300,
+) -> tuple[int, str, str]:
+    """Run *cmd* capturing stdout/stderr via threads to avoid pipe deadlocks.
+
+    Returns ``(returncode, stdout, stderr)``.
+
+    Raises ``subprocess.TimeoutExpired`` (with accumulated output attached) if the
+    subprocess runs past *timeout* seconds without exiting.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        cwd=cwd,
+    )
+
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+
+    def _reader(stream, parts: list[str]) -> None:
+        for line in stream:
+            parts.append(line)
+
+    t_out = threading.Thread(target=_reader, args=(proc.stdout, stdout_parts), daemon=True)
+    t_err = threading.Thread(target=_reader, args=(proc.stderr, stderr_parts), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        proc.wait()
+
+    t_out.join(timeout=5)
+    t_err.join(timeout=5)
+
+    stdout = "".join(stdout_parts)
+    stderr = "".join(stderr_parts)
+
+    if timed_out:
+        exc = subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+        raise exc
+
+    return proc.returncode, stdout, stderr
+
+
 def call(
     prompt: str,
     *,
@@ -74,16 +130,16 @@ def call(
     last_error = None
     for attempt in range(max_retries):
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300,
-                stdin=subprocess.DEVNULL,
+            returncode, stdout, stderr = _stream_subprocess(
+                cmd, timeout=300,
             )
-            if result.returncode != 0:
+
+            if returncode != 0:
                 if quota_policy is not None:
-                    signal = detect_quota_signal(result.stderr, result.stdout)
+                    signal = detect_quota_signal(stderr)
                     if signal.is_quota_error:
                         if on_quota_error is not None:
-                            on_quota_error(result.stderr, model)
+                            on_quota_error(stderr, model)
                         state.consecutive_quota_errors += 1
                         state.quota_error_timestamps.append(datetime.utcnow())
                         if should_hibernate(state, quota_policy):
@@ -103,18 +159,18 @@ def call(
                         )
                         time.sleep(wait)
                         last_error = RuntimeError(
-                            f"{cli_name} CLI exited with code {result.returncode}: "
-                            f"{result.stderr[:500]}"
+                            f"{cli_name} CLI exited with code {returncode}: "
+                            f"{stderr[:500]}"
                         )
                         continue
                     else:
                         # Non-quota error — reset consecutive quota counter
                         state.consecutive_quota_errors = 0
                 raise RuntimeError(
-                    f"{cli_name} CLI exited with code {result.returncode}: "
-                    f"{result.stderr[:500]}"
+                    f"{cli_name} CLI exited with code {returncode}: "
+                    f"{stderr[:500]}"
                 )
-            return LLMResponse(text=result.stdout, model=model)
+            return LLMResponse(text=stdout, model=model)
         except subprocess.TimeoutExpired as e:
             last_error = e
             if quota_policy is not None:

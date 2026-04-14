@@ -16,7 +16,7 @@ from typing import Optional
 from . import llm
 from .config import SONNET, PROVIDER
 from .db import DB, DirectorEntry, Experiment, Rubric
-from .quota import PersistentQuotaError
+from .quota import PersistentQuotaError, QuotaPolicy
 
 log = logging.getLogger(__name__)
 
@@ -66,7 +66,8 @@ def create_rubric(task_description: str, codebase_summary: str) -> Rubric:
         task_description=task_description,
         codebase_summary=codebase_summary,
     )
-    response = llm.call(prompt, system=RUBRIC_SYSTEM, model=llm.OPUS, max_tokens=8192)
+    response = llm.call(prompt, system=RUBRIC_SYSTEM, model=llm.OPUS, max_tokens=8192,
+                        quota_policy=QuotaPolicy())
     data = llm.extract_json(response.text)
     if not data:
         raise ValueError(f"Rubric agent returned non-JSON response:\n{response.text[:500]}")
@@ -302,7 +303,8 @@ Score this experiment. Respond with ONLY: {{"score": <float>}}
 
     for attempt in range(3):
         try:
-            response = llm.call(prompt, system=JUDGE_SYSTEM, model=llm.HAIKU)
+            response = llm.call(prompt, system=JUDGE_SYSTEM, model=llm.HAIKU,
+                                quota_policy=QuotaPolicy())
             score = llm.extract_float(response.text)
             if score is not None:
                 return score
@@ -384,7 +386,8 @@ def run_director(
         best_score=f"{best_score:.4f}" if best_score is not None else "N/A",
     )
 
-    response = llm.call(prompt, system=DIRECTOR_SYSTEM, model=llm.SONNET)
+    response = llm.call(prompt, system=DIRECTOR_SYSTEM, model=llm.SONNET,
+                        quota_policy=QuotaPolicy())
     data = llm.extract_json(response.text)
 
     if data and isinstance(data, dict):
@@ -488,7 +491,8 @@ def generate_ideas(
         num_ideas=num_ideas,
     )
 
-    response = llm.call(prompt, system=IDEAGEN_SYSTEM, model=llm.SONNET)
+    response = llm.call(prompt, system=IDEAGEN_SYSTEM, model=llm.SONNET,
+                        quota_policy=QuotaPolicy())
     data = llm.extract_json(response.text)
 
     ideas = []

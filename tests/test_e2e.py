@@ -293,6 +293,8 @@ def run_e2e(dry_run: bool = False, model: str = None):
         print(f"  This will take several minutes...\n")
 
         t0 = time.time()
+        env = os.environ.copy()
+        env["AUTO_SESSIONS_DIR"] = str(tmpdir / "sessions")
         result = subprocess.run(
             [
                 sys.executable, "-m", "auto.auto",
@@ -308,6 +310,7 @@ def run_e2e(dry_run: bool = False, model: str = None):
                 "--ideas-per-batch", "2",
             ] + (["--model", model] if model else []),
             cwd=str(PROJECT_ROOT),
+            env=env,
             timeout=MAX_EXPERIMENTS * (TIME_BUDGET + 180) + 300,  # generous timeout
             input="y\n",  # auto-approve rubric
             text=True,

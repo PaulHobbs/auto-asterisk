@@ -10,11 +10,11 @@ from typing import Optional
 _QUOTA_PATTERNS = [
     ("claude_rate_limit", re.compile(
         r"(rate.limit|too many requests|quota exceeded|usage limit|"
-        r"overloaded|capacity|529|429)", re.IGNORECASE
+        r"\boverloaded\b|\bcapacity\b|\b529\b|\b429\b)", re.IGNORECASE
     )),
     ("gemini_quota", re.compile(
         r"(RESOURCE_EXHAUSTED|quota.exceeded|rate.limit|"
-        r"too many requests|429|per.minute.quota)", re.IGNORECASE
+        r"too many requests|\b429\b|per.minute.quota)", re.IGNORECASE
     )),
 ]
 
